@@ -385,18 +385,26 @@ _WORDS = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z0-9]+|[A-Z0-9]+")  # mots d
 
 def schema_naming(name: str) -> tuple[str, str, str]:
     """Nom de sortie d'un schéma : (nouveau nom, nom de base, type).
-        S_ActorCompany          -> ("ActorCompanyObject", "ActorCompany", "Object")
+        S_ActorCompany          -> ("ActorCompanyObject", "ActorCompany", "Object")   préfixe : + Object
+        ActorCompany            -> ("ActorCompany", "ActorCompany", "Object")         sans préfixe : nom gardé
+        account_annual_revenue  -> ("AccountAnnualRevenue", …, "Object")              (toujours en PascalCase)
         E_ActorComposite_Input  -> ("ActorCompositeInput", "ActorComposite", "Input")
         E_Input_Address         -> ("AddressInput", "Address", "Input")
-    Préfixe retiré, séparateurs supprimés, PascalCase ; « Input » / « Output » reconnus comme mots
-    entiers (pas « Throughput ») et placés à la fin ; sinon le suffixe est « Object »."""
+    Préfixe (S_, A_, E_ …) retiré, séparateurs supprimés, PascalCase. « Input » / « Output » sont reconnus
+    comme mots entiers (pas « Throughput ») et placés à la fin, avec ou sans préfixe. Sinon, le suffixe
+    « Object » n'est ajouté que si le nom avait un préfixe."""
+    prefixed = bool(_PREFIX.match(name))
     words = [w for part in _SEPARATORS.split(_PREFIX.sub("", name)) for w in _WORDS.findall(part)]
     lowered = [w.lower() for w in words]
     kind = "Input" if "input" in lowered else "Output" if "output" in lowered else "Object"
     base = "".join(w[0].upper() + w[1:] for w in words if w.lower() not in ("input", "output"))
     if not base:
         raise ValueError(f"Nom de schéma sans partie utile après renommage : {name}")
-    if kind == "Object" and base.endswith("Object") and base != "Object":
+    if kind != "Object":
+        return base + kind, base, kind
+    if not prefixed:
+        return base, base, kind  # sans préfixe : pas de suffixe Object
+    if base.endswith("Object") and base != "Object":
         base = base[: -len("Object")]  # S_ActorObject -> ActorObject, pas ActorObjectObject
     return base + kind, base, kind
 

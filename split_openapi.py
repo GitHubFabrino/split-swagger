@@ -147,9 +147,10 @@ def groups_in_dependency_order(graph: dict[str, set[str]]) -> list[list[str]]:
 
 # ================================================================ lecture et contrôles
 
-def read_schemas(source: Path) -> dict:
-    """Schémas du fichier, contrôlés puis renommés : {NouveauNom: schéma}, dont les références
-    internes visent déjà les nouveaux noms."""
+def read_schemas(source: Path) -> tuple[dict, dict]:
+    """Schémas du fichier, contrôlés puis renommés : ({NouveauNom: schéma}, {NouveauNom: (base, type)}).
+    Les références internes visent déjà les nouveaux noms. Base et type viennent du nom d'origine
+    (S_ActorCompany -> "ActorCompany", "Object") : ils servent à la description du fichier."""
     if not source.is_file():
         raise ValueError(f"Fichier de schémas introuvable : {source.resolve()} "
                          f"(lancez le script depuis la racine du projet, ou adaptez SOURCE_FILE dans openapi_common.py)")
@@ -174,8 +175,10 @@ def read_schemas(source: Path) -> dict:
             raise ValueError(f"{name} référence un schéma absent du fichier : {missing[0]}")
 
     new_names = rename_map(schemas)
-    return {new_names[name]: without_sources(map_refs(schema, names, lambda dep: LOCAL + new_names[dep]))
-            for name, schema in schemas.items()}
+    renamed = {new_names[name]: without_sources(map_refs(schema, names, lambda dep: LOCAL + new_names[dep]))
+               for name, schema in schemas.items()}
+    origins = {new_names[name]: schema_naming(name)[1:] for name in schemas}
+    return renamed, origins
 
 
 # ================================================================ décisions de version
@@ -334,9 +337,9 @@ BANNER = "#" * 62
 BANNER_TITLE = ("#" + "Schema file information".center(60)).rstrip()
 
 
-def render(name: str, version: Version, content: dict, source: Path) -> str:
+def render(name: str, version: Version, content: dict, source: Path, origin: tuple[str, str]) -> str:
     """Texte d'un fichier de schéma : en-tête, info, components.schemas.<Nom>."""
-    _, base, kind = schema_naming(name)
+    base, kind = origin
     header = (f"# created on: {date.today():%d/%m/%Y} split from {source.name}\n\n"
               f"{BANNER}\n{BANNER_TITLE}\n{BANNER}\n\n")
     info = (f"info:\n"
@@ -350,7 +353,7 @@ def render(name: str, version: Version, content: dict, source: Path) -> str:
 
 
 def split(source: Path, out: Path, forced_major: set[str], dry_run: bool) -> None:
-    schemas = read_schemas(source)
+    schemas, origins = read_schemas(source)
     forced = {schema_naming(name)[0] for name in forced_major}  # --major accepte l'ancien ou le nouveau nom
     unknown = sorted(name for name in forced_major if schema_naming(name)[0] not in schemas)
     if unknown:
@@ -364,7 +367,7 @@ def split(source: Path, out: Path, forced_major: set[str], dry_run: bool) -> Non
         for name, version, content, _ in created:  # une version réutilisée n'est jamais réécrite
             path = schema_file(out, name, version)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(render(name, version, content, source), encoding="utf-8")
+            path.write_text(render(name, version, content, source, origins[name]), encoding="utf-8")
 
     reused = [file_name(name, version)[:-5] for name, version, _, reason in splitter.writes if not reason]
     print(f"{'[simulation] ' if dry_run else ''}✔ {source} -> {out}/")
