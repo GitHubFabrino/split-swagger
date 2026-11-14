@@ -49,7 +49,8 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openapi_common import (  # noqa: E402
-    APIS_DIR, LOCAL, SCHEMAS_DIR, dump, load, loads, map_refs, rename_map, schema_diff, schema_refs, shape,
+    APIS_DIR, LOCAL, SCHEMAS_DIR, api_name, block_ref_schema, dump, load, loads, map_refs,
+    rename_map, renamed_for_api, schema_diff, to_sibling_refs, schema_naming, schema_refs, shape,
     yaml_error)
 
 # Nom/Nom_V1.2.yaml (format actuel) ; Nom/Nom_v1.2.yaml (ancien format) reste reconnu
@@ -120,7 +121,8 @@ class Catalog:
     def matching_major(self, name: str, inline: dict, names: set, renamed: dict[str, str]) -> int | None:
         """Majeure de la version existante identique au schéma défini dans une API
         (name : nouveau nom ; renamed : {ancien nom: nouveau nom} des schémas de l'API)."""
-        target = shape(map_refs(inline, names, lambda dep: f"../{renamed[dep]}/{self.ref(renamed[dep], 0, 0)}"))
+        target = shape(to_sibling_refs(
+            map_refs(inline, names, lambda dep: f"../{renamed[dep]}/{self.ref(renamed[dep], 0, 0)}")))
         for major, minor in reversed(self.all(name)):
             if shape(self.content(name, major, minor)) == target:
                 return major
@@ -146,19 +148,32 @@ def externalize(doc: dict, catalog: Catalog, prefix: str, label: str) -> tuple[d
         renamed = rename_map(used)
     except ValueError as error:
         return None, [], [f"{label} : {error}"]
+    # Un schéma renommé à l'extraction porte le nom de l'API : Error -> ErrorIgdRdvBulkCallback.
+    api = api_name(label)
+    alternative = {name: renamed_for_api(renamed[name], schema_naming(name)[1], api)[0] for name in used}
     majors: dict[str, int] = {}
+    for _ in range(len(used) + 1):  # renommer une dépendance change le contenu attendu des autres
+        majors, changed = {}, False
+        for name in sorted(used & names):
+            for candidate in dict.fromkeys((renamed[name], alternative[name])):
+                if catalog.all(candidate) and (
+                        major := catalog.matching_major(candidate, inline[name], names, renamed)) is not None:
+                    majors[name] = major
+                    changed |= candidate != renamed[name]
+                    renamed[name] = candidate
+                    break
+        if not changed:
+            break
     errors = []
-    for name in sorted(used):
+    for name in sorted(used - set(majors)):
         new = renamed[name]
-        if not catalog.all(new):
-            errors.append(f"{label} : schéma {name} ({new}) absent de schemas/ (lancez split_openapi.py)")
-        elif name not in inline:
+        if name not in inline:
             errors.append(f"{label} : #/components/schemas/{name} référencé mais non défini dans l'API")
-        elif (major := catalog.matching_major(new, inline[name], names, renamed)) is None:
-            errors.append(f"{label} : {name} défini dans l'API ne correspond à aucune version de "
-                          f"schemas/{new}/ (modifié ? lancez split_openapi.py sur le nouveau fichier)")
+        elif not catalog.all(new) and not catalog.all(alternative[name]):
+            errors.append(f"{label} : schéma {name} ({new}) absent de schemas/ (lancez split_openapi.py)")
         else:
-            majors[name] = major
+            errors.append(f"{label} : {name} défini dans l'API ne correspond à aucune version de "
+                          f"schemas/{new}/ (modifié ? lancez extract_api_schemas.py)")
     if errors:
         return None, [], errors
 
@@ -175,6 +190,36 @@ def externalize(doc: dict, catalog: Catalog, prefix: str, label: str) -> tuple[d
     if inline:
         changes.append(f"{len(inline)} schéma(s) retiré(s) de components.schemas")
     return new_doc, changes, []
+
+
+def resolve_block_refs(doc: dict, catalog: Catalog, prefix: str) -> tuple[dict, list[str]]:
+    """Étape 0 : $ref vers le fichier commun en bloc (…/rdv-actor-schemas.yaml#/components/schemas/S_X)
+    -> fichier découpé correspondant (XObject/XObject_V<dernière>.yaml). Une cible inconnue reste telle quelle."""
+    changes = []
+
+    def to_ref(original: str) -> str:
+        name = schema_naming(original)[0]
+        versions = catalog.all(name)
+        if not versions:
+            raise LookupError(original)
+        major, minor = versions[-1]
+        changes.append(f"{original} (fichier commun) -> {name} v{major}.{minor}")
+        return f"{prefix}/{name}/{catalog.ref(name, major, minor)}"
+
+    def safe(original: str, value: str) -> str:
+        try:
+            return to_ref(original)
+        except (LookupError, ValueError):
+            return value
+
+    def walk(node):
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        return {k: (safe(name, v) if k == "$ref" and (name := block_ref_schema(v)) else walk(v)) for k, v in node.items()}
+
+    return walk(doc), sorted(set(changes))
 
 
 def upgrade_versions(text: str, catalog: Catalog) -> tuple[str, list[str]]:
@@ -202,14 +247,18 @@ def sync_api(api_file: Path, catalog: Catalog, write: bool, root: Path) -> tuple
         doc = loads(text) if LOCAL in text or "components" in text else None
     except yaml.YAMLError as error:  # une API invalide est signalée, les autres sont quand même traitées
         return [], [str(yaml_error(label, error))]
+    prefix = os.path.relpath(catalog.dir, api_file.parent).replace(os.sep, "/")
+    if doc is not None and ".yaml#/components/schemas/" in text:
+        doc, changes = resolve_block_refs(doc, catalog, prefix)
     has_inline = bool(((doc or {}).get("components") or {}).get("schemas"))
     if doc is not None and (has_inline or LOCAL in text):
-        prefix = os.path.relpath(catalog.dir, api_file.parent).replace(os.sep, "/")
-        new_doc, changes, errors = externalize(doc, catalog, prefix, label)
+        new_doc, changed, errors = externalize(doc, catalog, prefix, label)
         if errors:
             return [], errors
-        if changes:
-            text = dump(new_doc)
+        changes += changed
+        doc = new_doc
+    if changes:
+        text = dump(doc)
 
     text, upgraded = upgrade_versions(text, catalog)
     changes += upgraded

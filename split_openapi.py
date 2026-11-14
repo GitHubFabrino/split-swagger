@@ -49,7 +49,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openapi_common import (  # noqa: E402
-    DESCRIPTIONS, LOCAL, SCHEMAS_DIR, SOURCE_FILE, breaking_changes, canon, dump, load, map_refs, other_refs, rename_map, schema_naming, schema_refs,
+    DESCRIPTIONS, LOCAL, SCHEMA_FILE_REF, SCHEMAS_DIR, SOURCE_FILE, breaking_changes, canon, to_sibling_refs, dump, load, map_refs, other_refs, rename_map, schema_naming, schema_refs,
     shape, without_sources)
 
 
@@ -147,33 +147,15 @@ def groups_in_dependency_order(graph: dict[str, set[str]]) -> list[list[str]]:
 
 # ================================================================ lecture et contrôles
 
-# Référence vers un fichier de schéma déjà découpé : …/Nom/Nom_V1.2.yaml(#/components/schemas/Nom)
-_SCHEMA_FILE_REF = re.compile(
-    r"(?:^|/)(?P<name>[^/#]+)/(?P=name)_[vV](?P<version>\d+\.\d+)\.yaml(?:#/components/schemas/(?P=name))?$")
-
-
-def _to_sibling_refs(node):
-    """Les $ref vers un fichier de schéma déjà découpé deviennent ../Nom/Nom_Vx.y.yaml#/components/schemas/Nom :
-    chemin valable depuis n'importe quel dossier de schéma (ils sont tous voisins)."""
-    if isinstance(node, list):
-        return [_to_sibling_refs(item) for item in node]
-    if not isinstance(node, dict):
-        return node
-    copy = {}
-    for key, value in node.items():
-        m = _SCHEMA_FILE_REF.search(value) if key == "$ref" and isinstance(value, str) else None
-        copy[key] = (f"../{m['name']}/{file_name(m['name'], m['version'])}{fragment(m['name'])}" if m
-                     else _to_sibling_refs(value))
-    return copy
-
-
-def prepare_schemas(schemas: dict, where: str) -> tuple[dict, dict]:
+def prepare_schemas(schemas: dict, where: str, resolve_external=None) -> tuple[dict, dict]:
     """Contrôle et renomme des schémas : ({NouveauNom: schéma}, {NouveauNom: (base, type)}).
     Les références internes visent les nouveaux noms ; celles vers un fichier de schéma déjà découpé sont
     acceptées. Base et type viennent du nom d'origine (S_ActorCompany -> "ActorCompany", "Object") :
     ils servent à la description du fichier."""
+    if resolve_external:  # ex. …/rdv-actor-schemas.yaml#/components/schemas/S_X -> ../XObject/XObject_V1.0.yaml#…
+        schemas = {name: resolve_external(schema) for name, schema in schemas.items()}
     names = set(schemas)
-    external = [ref for ref in other_refs(schemas, names) if not _SCHEMA_FILE_REF.search(ref)]
+    external = [ref for ref in other_refs(schemas, names) if not SCHEMA_FILE_REF.search(ref)]
     if external:
         raise ValueError(f"{where} : {len(external)} référence(s) ne visent ni un schéma du fichier ni un fichier "
                          f"de schéma découpé (ex. {external[0]}).")
@@ -183,7 +165,7 @@ def prepare_schemas(schemas: dict, where: str) -> tuple[dict, dict]:
             raise ValueError(f"{where} : {name} référence un schéma absent du fichier : {missing[0]}")
 
     new_names = rename_map(schemas)
-    renamed = {new_names[name]: _to_sibling_refs(without_sources(
+    renamed = {new_names[name]: to_sibling_refs(without_sources(
                    map_refs(schema, names, lambda dep: LOCAL + new_names[dep])))
                for name, schema in schemas.items()}
     origins = {new_names[name]: schema_naming(name)[1:] for name in schemas}
@@ -223,21 +205,34 @@ class Splitter:
         self.writes: list[tuple[str, Version, dict, str | None]] = []  # (Nom, version, contenu, raison ; None = réutilisé)
         self.warnings: list[str] = []
         self.breaking: dict[str, list[str]] = {}      # nouvelle version mineure qui semble cassante : détails
+        self.final: dict[str, str] = {}              # nom écrit sur disque, s'il diffère (renommage à l'extraction)
+        self.origin_override: dict[str, tuple[str, str]] = {}  # (base, type) d'un schéma renommé, par nom sur disque
         self._versions: dict[str, list[Version]] = {}
         self._files: dict[tuple[str, Version], dict] = {}
 
+    def fn(self, name: str) -> str:
+        """Nom sur disque (dossier, fichier, components.schemas) d'un schéma."""
+        return self.final.get(name, name)
+
+    def is_forced(self, name: str) -> bool:
+        return name in self.forced or self.fn(name) in self.forced
+
+    def prepare_group(self, group: list[str]) -> None:
+        """Point d'extension appelé avant de décider d'un groupe (renommage à l'extraction)."""
+
     # -- accès au disque, mis en cache (rien n'est écrit pendant les décisions)
     def versions(self, name: str) -> list[Version]:
-        if name not in self._versions:
-            self._versions[name] = existing_versions(self.out, name)
-        return self._versions[name]
+        disk = self.fn(name)
+        if disk not in self._versions:
+            self._versions[disk] = existing_versions(self.out, disk)
+        return self._versions[disk]
 
     def read(self, name: str, version: Version) -> dict:
-        key = (name, version)
-        if key not in self._files:
-            doc = load(schema_file(self.out, name, version))
-            self._files[key] = doc["components"]["schemas"][name]
-        return self._files[key]
+        disk = self.fn(name)
+        if (disk, version) not in self._files:
+            doc = load(schema_file(self.out, disk, version))
+            self._files[(disk, version)] = doc["components"]["schemas"][disk]
+        return self._files[(disk, version)]
 
     def latest_in_major(self, name: str, major: int) -> Version:
         return [v for v in self.versions(name) if v.major == major][-1]
@@ -251,27 +246,30 @@ class Splitter:
         undecided : schémas dont la version n'est pas encore choisie (provisoirement v0.0)."""
         def to_file(dep: str) -> str:
             version = "0.0" if dep in undecided else self.chosen[dep]
-            return f"../{dep}/{file_name(dep, version)}{fragment(dep)}"
+            disk = self.fn(dep)
+            return f"../{disk}/{file_name(disk, version)}{fragment(disk)}"
         return without_sources(map_refs(self.schemas[name], self.names, to_file))
 
     # -- décision pour un groupe : un schéma seul, ou des schémas en cycle
     def decide(self, group: list[str]) -> None:
+        self.prepare_group(group)
         members = set(group)
+        disk_names = {self.fn(name) for name in group}  # tels qu'ils apparaissent dans les $ref
         cyclic = len(group) > 1 or group[0] in self.deps(group[0])
         draft = {name: self.content(name, undecided=members) for name in group}
 
         # 1. Tous identiques à une version existante : on les réutilise.
-        matches = {name: self.find_identical(name, draft[name], members) for name in group}
+        matches = {name: self.find_identical(name, draft[name], disk_names) for name in group}
         if all(matches.values()):
             for name in group:
                 self.reuse(name, matches[name])
             return
 
         # 2. Sinon tous reçoivent une nouvelle version (dans un cycle, ils se référencent mutuellement).
-        is_major = bool(members & self.forced) or any(
+        is_major = any(self.is_forced(name) for name in group) or any(
             dep in self.major_bumped for name in group for dep in self.deps(name) - members)
         existing = [name for name in group if self.versions(name)]
-        previous = self.base_versions(existing, draft, members, is_major)
+        previous = self.base_versions(existing, draft, disk_names, is_major)
         for name in group:
             if name not in previous:
                 self.chosen[name] = Version(1, 0)
@@ -283,7 +281,7 @@ class Splitter:
         self.renewed |= members
 
         # 3. Contenu définitif, raison et avertissement.
-        label = " ↔ ".join(group)
+        label = " ↔ ".join(self.fn(name) for name in group)
         for name in group:
             content = self.content(name)
             if name not in previous:
@@ -295,11 +293,12 @@ class Splitter:
                     reason += f" ({label})"
                 if not is_major:
                     self.warn_if_breaking(name, old, content)
-            self.writes.append((name, self.chosen[name], content, reason))
+            self.writes.append((self.fn(name), self.chosen[name], content, reason))
 
     def find_identical(self, name: str, draft: dict, members: set[str]) -> Version | None:
-        """Version existante identique au brouillon (versions des membres du groupe ignorées)."""
-        if name in self.forced:
+        """Version existante identique au brouillon (versions des membres du groupe ignorées ;
+        members : leurs noms sur disque)."""
+        if self.is_forced(name):
             return None
         target = shape(draft, only=members)
         return next((v for v in reversed(self.versions(name)) if shape(self.read(name, v), only=members) == target), None)
@@ -308,9 +307,9 @@ class Splitter:
         """Réutilise la dernière version de la majeure de match (règle « toujours la dernière »)."""
         target = self.latest_in_major(name, match.major)
         self.chosen[name] = target
-        self.writes.append((name, target, self.read(name, target), None))
+        self.writes.append((self.fn(name), target, self.read(name, target), None))
         if target != match:
-            self.warnings.append(f"{name} : identique à l'ancienne v{match} -> v{target} (dernière de la majeure) "
+            self.warnings.append(f"{self.fn(name)} : identique à l'ancienne v{match} -> v{target} (dernière de la majeure) "
                                  f"conservée. Le fichier contenait une copie périmée de ce schéma.")
 
     def base_versions(self, group: list[str], draft: dict, members: set[str], is_major: bool) -> dict[str, Version]:
@@ -336,10 +335,10 @@ class Splitter:
         return compatible + [m for m in same_deps if m not in compatible]
 
     def why(self, name: str, old: dict, new: dict, members: set[str], is_major: bool, cyclic: bool) -> str:
-        if name in self.forced:
+        if self.is_forced(name):
             return "changement cassant (--major)"
         if shape(old) == shape(new):  # seules les versions des références ont changé
-            changed = sorted((self.deps(name) - members) & self.renewed)
+            changed = sorted(self.fn(dep) for dep in (self.deps(name) - members) & self.renewed)
             cause = f"cascade : {', '.join(changed)}" if changed else "cascade dans le cycle"
             return cause + (" (majeure)" if is_major else "")
         if is_major:
@@ -349,9 +348,10 @@ class Splitter:
     def warn_if_breaking(self, name: str, old: dict, new: dict) -> None:
         breaking = breaking_changes(old, new)
         if breaking:
-            self.breaking[name] = breaking
-            self.warnings.append(f"{name}_V{self.chosen[name]} semble cassant ({' ; '.join(breaking)}). "
-                                 f"Si c'est voulu, relancez avec --major {name} (et --dry-run pour vérifier).")
+            disk = self.fn(name)
+            self.breaking[disk] = breaking
+            self.warnings.append(f"{disk}_V{self.chosen[name]} semble cassant ({' ; '.join(breaking)}). "
+                                 f"Si c'est voulu, relancez avec --major {disk} (et --dry-run pour vérifier).")
 
     def run(self) -> None:
         graph = {name: self.deps(name) for name in self.schemas}
@@ -394,7 +394,8 @@ def render(name: str, version: Version, content: dict, source_name: str, origin:
 
 
 def split_schemas(schemas: dict, origins: dict, out: Path, forced_major: set[str], dry_run: bool,
-                  source_name: str, title: str, strict: bool = False) -> list[tuple[str, Version, str]]:
+                  source_name: str, title: str, strict: bool = False,
+                  splitter_class: type = None) -> list[tuple[str, Version, str]]:
     """Versionne et écrit des schémas déjà préparés (prepare_schemas) dans le dossier des schémas.
     Affiche le rapport sous le titre donné. Renvoie les fichiers créés : [(Nom, version, raison)].
     strict : une nouvelle version mineure qui semble cassante bloque tout (ValueError, rien n'est écrit) ;
@@ -404,8 +405,13 @@ def split_schemas(schemas: dict, origins: dict, out: Path, forced_major: set[str
     if unknown:
         raise ValueError(f"--major : schéma(s) absent(s) : {', '.join(unknown)}")
 
-    splitter = Splitter(schemas, out, forced)
+    splitter = (splitter_class or Splitter)(schemas, out, forced)
     splitter.run()
+    base_of = {splitter.fn(base): base for base in schemas}
+
+    def origin_of(disk: str) -> tuple[str, str]:
+        return splitter.origin_override.get(disk, origins[base_of[disk]])
+
     if strict and splitter.breaking:
         details = "\n".join(
             f"      - {name} : {' ; '.join(items)}" + _origin_note(out, splitter, name, source_name)
@@ -440,10 +446,12 @@ def split_schemas(schemas: dict, origins: dict, out: Path, forced_major: set[str
         for name, version, content, _ in created:  # une version réutilisée n'est jamais réécrite
             path = schema_file(out, name, version)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(render(name, version, content, source_name, origins[name]), encoding="utf-8")
+            path.write_text(render(name, version, content, source_name, origin_of(name)), encoding="utf-8")
 
     reused = [file_name(name, version)[:-5] for name, version, _, reason in splitter.writes if not reason]
     print(f"{'[simulation] ' if dry_run else ''}{title}")
+    for line in getattr(splitter, "notes", []):  # vérifications détaillées (extraction)
+        print(f"  {line}")
     for name, version, _, reason in created:
         print(f"  + {name}/{file_name(name, version)}  ({reason})")
     if reused:

@@ -440,3 +440,75 @@ def rename_map(names) -> dict[str, str]:
         details = "; ".join(f"{', '.join(olds)} -> {new}" for new, olds in sorted(conflicts.items()))
         raise ValueError(f"Noms en conflit après renommage : {details}")
     return renamed
+
+
+# ================================================================ extraction depuis les API
+
+def pascal_case(text: str) -> str:
+    """igd-rdv-bulk-callback -> IgdRdvBulkCallback."""
+    return "".join(w[0].upper() + w[1:] for part in _SEPARATORS.split(text) for w in _WORDS.findall(part))
+
+
+def api_name(label: str) -> str:
+    """Nom d'une API d'après son chemin : 'igd-rdv-bulk-callback/v1/x.yaml' -> 'igd-rdv-bulk-callback'.
+    Un fichier hors <api>/v<x>/ (ex. 'rdv-actor-schemas.yaml') donne son propre nom."""
+    parts = [p for p in re.split(r"[\\/]", label.strip()) if p]
+    return parts[0] if len(parts) > 1 else (parts[0] if parts else "")
+
+
+def renamed_for_api(new_name: str, base: str, api: str) -> tuple[str, str]:
+    """Nom d'un schéma propre à une API : le nom de l'API est inséré avant le suffixe de type.
+        Error,         base Error   -> ErrorIgdRdvBulkCallback
+        AddressObject, base Address -> AddressIgdRdvBulkCallbackObject
+        AddressInput,  base Address -> AddressIgdRdvBulkCallbackInput
+    Renvoie (nouveau nom, nouvelle base)."""
+    suffix = pascal_case(api)
+    tail = new_name[len(base):] if new_name.startswith(base) else ""
+    return base + suffix + tail, base + suffix
+
+
+# Référence vers un schéma d'un autre fichier .yaml qui n'est pas un fichier de schéma découpé,
+# ex. ../../schemas/rdv-actor-schemas.yaml#/components/schemas/S_ExternalId (fichier commun en bloc).
+_BLOCK_REF = re.compile(r"^(?P<file>[^#]+\.ya?ml)#/components/schemas/(?P<name>[^/#]+)$")
+_SPLIT_FILE = re.compile(r"(?:^|/)(?P<name>[^/]+)/(?P=name)_[vV]\d+\.\d+\.yaml$")
+
+
+def block_ref_schema(ref) -> str | None:
+    """Nom d'origine du schéma visé si ref pointe vers un fichier en bloc (pas un fichier découpé)."""
+    if not isinstance(ref, str):
+        return None
+    m = _BLOCK_REF.match(ref)
+    if not m or _SPLIT_FILE.search(m["file"].replace("\\", "/")):
+        return None
+    return m["name"]
+
+
+def map_block_refs(node, to_ref):
+    """Copie de node où chaque $ref vers un fichier en bloc est remplacée par to_ref(nom d'origine)
+    (to_ref peut lever ValueError si le schéma est introuvable)."""
+    if isinstance(node, list):
+        return [map_block_refs(item, to_ref) for item in node]
+    if not isinstance(node, dict):
+        return node
+    return {key: (to_ref(name) if key == "$ref" and (name := block_ref_schema(value)) else map_block_refs(value, to_ref))
+            for key, value in node.items()}
+
+
+# Référence vers un fichier de schéma découpé : …/Nom/Nom_V1.2.yaml(#/components/schemas/Nom)
+SCHEMA_FILE_REF = re.compile(
+    r"(?:^|[\\/])(?P<name>[^/\\#]+)[\\/](?P=name)_[vV](?P<version>\d+\.\d+)\.yaml(?:#/components/schemas/(?P=name))?$")
+
+
+def to_sibling_refs(node):
+    """Les $ref vers un fichier de schéma découpé deviennent ../Nom/Nom_Vx.y.yaml#/components/schemas/Nom :
+    le chemin vu depuis un autre dossier de schéma (ils sont tous voisins)."""
+    if isinstance(node, list):
+        return [to_sibling_refs(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    copy = {}
+    for key, value in node.items():
+        m = SCHEMA_FILE_REF.search(value) if key == "$ref" and isinstance(value, str) else None
+        copy[key] = (f"../{m['name']}/{m['name']}_V{m['version']}.yaml#/components/schemas/{m['name']}" if m
+                     else to_sibling_refs(value))
+    return copy

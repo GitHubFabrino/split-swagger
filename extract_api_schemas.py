@@ -6,24 +6,25 @@ Extrait les schémas définis dans les API vers le dossier des schémas commun, 
 (<dossier des API>/<api>/v<x>/<api>.yaml, x le plus grand) :
 
   1. les schémas de components.schemas sont découpés dans <dossier des schémas>/<Nom>/<Nom>_V<x.y>.yaml,
-     exactement comme split_openapi.py : même renommage (S_Actor -> ActorObject, Actor -> Actor,
-     E_Actor_Input -> ActorInput), même format de fichier, même versionnement (identique -> réutilisé,
-     modifié -> nouvelle version, cascade, cycles). Plus strict que split_openapi.py : comme l'API est
-     synchronisée aussitôt, un changement qui semble cassant sans --major bloque l'API (rien n'est écrit
-     pour elle), sinon les autres API qui utilisent ce schéma recevraient ce changement ;
-  2. l'API est aussitôt synchronisée (comme sync_schemas.py) : ses $ref pointent vers ces fichiers et
-     components.schemas est retiré de l'API.
+     comme split_openapi.py (même renommage, même format, même versionnement), avec une vérification
+     détaillée quand un schéma du même nom existe déjà : comparé propriété par propriété à sa dernière
+     version,
+       - identique                                  -> réutilisé ;
+       - différent, existant créé depuis une autre source (autre API, fichier commun)
+                                                    -> renommé avec le nom de l'API :
+                                                       Error -> ErrorIgdRdvBulkCallback,
+                                                       S_Address -> AddressIgdRdvBulkCallbackObject ;
+       - différent, existant créé depuis la même API -> nouvelle version (le schéma évolue).
+     Un schéma qui référence un schéma renommé est vérifié à son tour (il peut être renommé aussi).
+     Les références vers le fichier commun en bloc (…/rdv-actor-schemas.yaml#/components/schemas/S_X)
+     pointent vers le fichier découpé correspondant (XObject_V<x.y>.yaml).
+     Un changement cassant d'un schéma de la même API sans --major bloque l'API (rien n'est écrit).
+  2. l'API est aussitôt synchronisée (comme sync_schemas.py).
 
 Les anciennes versions d'une API (v1, v2 quand v3 existe) ne sont jamais modifiées.
-Une API sans schéma défini (déjà extraite) est simplement indiquée « à jour ».
 
 Usage :
     python3 extract_api_schemas.py [api.yaml ...] [--schemas-dir D] [--apis-dir D] [--major Nom,Nom] [--dry-run]
-
-    Sans argument : SCHEMAS_DIR et APIS_DIR de openapi_common.py (configuration du projet).
-    api.yaml ...   API à traiter (défaut : la dernière version de chaque API)
-    --major        schémas ayant un changement cassant (ancien ou nouveau nom)
-    --dry-run      affiche ce qui serait extrait, sans rien écrire ni synchroniser
 
 Dépendances : PyYAML, et openapi_common.py, split_openapi.py, sync_schemas.py à côté de ce script.
 """
@@ -31,15 +32,83 @@ Dépendances : PyYAML, et openapi_common.py, split_openapi.py, sync_schemas.py �
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from openapi_common import APIS_DIR, SCHEMAS_DIR, load, schema_naming  # noqa: E402
-from split_openapi import prepare_schemas, split_schemas  # noqa: E402
+from openapi_common import (  # noqa: E402
+    APIS_DIR, SCHEMAS_DIR, api_name, load, map_block_refs, renamed_for_api, schema_diff, schema_naming, shape)
+from split_openapi import (  # noqa: E402
+    Splitter, existing_versions, file_name, fragment, prepare_schemas, schema_file, split_schemas)
 from sync_schemas import discover_apis, display, run  # noqa: E402
+
+_SPLIT_FROM = re.compile(r"^# created on: \S+ split from (?P<source>.+)$", re.M)
+_DIFF_MARKS = (("added", "+"), ("removed", "-"), ("changed", "~"), ("dependencies", "↻"))
+
+
+def checking_splitter(api: str, origins: dict) -> type:
+    """Splitter qui vérifie, avant de versionner, chaque schéma dont le nom existe déjà."""
+
+    class CheckingSplitter(Splitter):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.notes: list[str] = []
+
+        def source_of(self, name: str) -> str:
+            """Fichier d'où vient la dernière version existante (en-tête « split from … »)."""
+            path = schema_file(self.out, self.fn(name), self.versions(name)[-1])
+            m = _SPLIT_FROM.search(path.read_text(encoding="utf-8"))
+            return m["source"].strip() if m else "?"
+
+        def prepare_group(self, group: list[str]) -> None:
+            members = set(group)
+            for _ in range(len(group) + 1):  # renommer un membre d'un cycle change le contenu des autres
+                disk = {self.fn(name) for name in group}
+                renamed_now = False
+                for name in group:
+                    if name in self.final or not self.versions(name):
+                        continue  # déjà renommé, ou nouveau
+                    latest = self.versions(name)[-1]
+                    existing, draft = self.read(name, latest), self.content(name, undecided=members)
+                    source = self.source_of(name)
+                    if shape(existing, only=disk) == shape(draft, only=disk):
+                        self.notes.append(f"✔ {name} : identique à {file_name(name, latest)[:-5]} "
+                                          f"(créé depuis {source}), vérifié détail par détail -> réutilisé")
+                        continue
+                    if api_name(source) == api:
+                        continue  # même API : le schéma évolue, nouvelle version
+                    _, base, kind = schema_naming(name)
+                    base = origins[name][0] if name in origins else base
+                    new_name, new_base = renamed_for_api(name, base, api)
+                    self.final[name] = new_name
+                    self.origin_override[new_name] = (new_base, origins.get(name, (base, kind))[1])
+                    self.notes.append(f"✎ {name} : diffère de {file_name(name, latest)[:-5]} "
+                                      f"(créé depuis {source}) -> renommé {new_name}")
+                    diff = schema_diff(existing, draft)
+                    lines = [f"{mark} {item}" for key, mark in _DIFF_MARKS for item in diff[key]]
+                    self.notes += [f"    {line}" for line in lines[:12]]
+                    if len(lines) > 12:
+                        self.notes.append(f"    … (+{len(lines) - 12} différence(s))")
+                    renamed_now = True
+                if not renamed_now:
+                    return
+
+    return CheckingSplitter
+
+
+def block_ref_resolver(schemas_dir: Path):
+    """$ref vers le fichier commun en bloc (…/rdv-actor-schemas.yaml#/components/schemas/S_X)
+    -> ../XObject/XObject_V<dernière>.yaml#/components/schemas/XObject."""
+    def to_ref(original: str) -> str:
+        name = schema_naming(original)[0]
+        versions = existing_versions(schemas_dir, name)
+        if not versions:
+            raise ValueError(f"{original} (fichier commun) : {name} absent de {schemas_dir} (lancez split_openapi.py)")
+        return f"../{name}/{file_name(name, versions[-1])}{fragment(name)}"
+    return lambda schema: map_block_refs(schema, to_ref)
 
 
 def extract(apis: list[Path], schemas_dir: Path, apis_dir: Path, forced_major: set[str], dry_run: bool) -> int:
@@ -48,21 +117,22 @@ def extract(apis: list[Path], schemas_dir: Path, apis_dir: Path, forced_major: s
     print(f"{tag}Extraction des schémas de {len(targets)} API (dernière version de chaque API) -> {schemas_dir}/")
 
     extracted, failed, used_major = [], [], set()
-    for api in targets:
-        label = display(api, apis_dir)
+    for api_file in targets:
+        label = display(api_file, apis_dir)
         try:
-            doc = load(api)
+            doc = load(api_file)
             inline = ((doc or {}).get("components") or {}).get("schemas") or {}
             if not inline:
                 print(f"  ✔ {label} : aucun schéma défini dans l'API (déjà extrait)")
                 continue
-            schemas, origins = prepare_schemas(inline, label)
+            schemas, origins = prepare_schemas(inline, label, block_ref_resolver(schemas_dir))
             here = {name for name in forced_major if schema_naming(name)[0] in schemas}
             used_major |= here
             print()
             split_schemas(schemas, origins, schemas_dir, here, dry_run, label,
-                          f"  → {label} : {len(inline)} schéma(s) défini(s) dans l'API", strict=True)
-            extracted.append(api)
+                          f"  → {label} : {len(inline)} schéma(s) défini(s) dans l'API", strict=True,
+                          splitter_class=checking_splitter(api_name(label), origins))
+            extracted.append(api_file)
         except ValueError as error:
             print(f"  ✖ {label} : {error}")
             failed.append(label)
