@@ -48,7 +48,8 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openapi_common import (  # noqa: E402
-    APIS_DIR, LOCAL, SCHEMAS_DIR, dump, load, loads, map_refs, rename_map, schema_diff, schema_refs, shape)
+    APIS_DIR, LOCAL, SCHEMAS_DIR, dump, load, loads, map_refs, rename_map, schema_diff, schema_refs, shape,
+    yaml_error)
 
 # Nom/Nom_V1.2.yaml (format actuel) ; Nom/Nom_v1.2.yaml (ancien format) reste reconnu
 SCHEMA_FILE = re.compile(r"^(?P<name>.+)_(?P<v>[vV])(?P<major>\d+)\.(?P<minor>\d+)\.yaml$")
@@ -196,7 +197,10 @@ def sync_api(api_file: Path, catalog: Catalog, write: bool, root: Path) -> tuple
     text = api_file.read_text(encoding="utf-8")
     changes: list[str] = []
 
-    doc = loads(text) if LOCAL in text or "components" in text else None
+    try:
+        doc = loads(text) if LOCAL in text or "components" in text else None
+    except yaml.YAMLError as error:  # une API invalide est signalée, les autres sont quand même traitées
+        return [], [str(yaml_error(label, error))]
     has_inline = bool(((doc or {}).get("components") or {}).get("schemas"))
     if doc is not None and (has_inline or LOCAL in text):
         prefix = os.path.relpath(catalog.dir, api_file.parent).replace(os.sep, "/")
@@ -313,8 +317,15 @@ def broken_refs(files: list[Path], root: Path) -> list[str]:
                 continue
             if m["schema"]:
                 if target not in schemas_in:
-                    doc = load(target)
+                    try:
+                        doc = load(target)
+                    except ValueError as error:
+                        errors.append(str(error))
+                        schemas_in[target] = None
+                        continue
                     schemas_in[target] = set(((doc or {}).get("components") or {}).get("schemas") or {})
+                if schemas_in[target] is None:
+                    continue
                 if m["schema"] not in schemas_in[target]:
                     errors.append(f"{display(file, root)} : schéma {m['schema']} absent de {m['ref']}")
     return list(dict.fromkeys(errors))

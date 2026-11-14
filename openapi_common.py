@@ -101,8 +101,26 @@ def loads(text: str):
     return yaml.load(text, Loader=Loader)
 
 
+def yaml_error(path, error: yaml.YAMLError) -> ValueError:
+    """Erreur YAML lisible : fichier, ligne, colonne, cause, et l'astuce pour les cas fréquents."""
+    mark = getattr(error, "problem_mark", None)
+    where = f", ligne {mark.line + 1}, colonne {mark.column + 1}" if mark else ""
+    problem = getattr(error, "problem", None) or str(error).splitlines()[0]
+    hint = ""
+    if mark and mark.buffer:
+        line = mark.buffer.splitlines()[mark.line] if mark.line < len(mark.buffer.splitlines()) else ""
+        value = line.split(":", 1)[1].strip() if ":" in line else line.strip()
+        if value[:1] in "&*!%@`":
+            hint = (f"\n    → « {line.strip()} » : une valeur qui commence par {value[0]} doit être entre guillemets, "
+                    f"ex. '{value}'" if "'" not in value else f"\n    → « {line.strip()} » : mettez la valeur entre guillemets")
+    return ValueError(f"YAML invalide dans {path}{where} : {problem}{hint}")
+
+
 def load(path: Path):
-    return loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        return loads(Path(path).read_text(encoding="utf-8"))
+    except yaml.YAMLError as error:
+        raise yaml_error(path, error) from None
 
 
 def dump(obj, indent: int = 2) -> str:
