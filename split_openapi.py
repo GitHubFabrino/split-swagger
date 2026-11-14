@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+Découpe un fichier de schémas OpenAPI (components.schemas, sans paths) en un fichier
+par schéma et par version :
+
+    <sortie>/schemas/<Nom>/<Nom>_v<x>.<y>.yaml
+
+Usage :
+    python3 split_openapi.py <schemas.yaml> <dossier-sortie> [--major Nom,Nom] [--dry-run]
+
+Versionnement automatique :
+    schéma nouveau                          -> _v1.0
+    identique à une version existante       -> réutilisée (la dernière de sa majeure)
+    modifié                                 -> version mineure suivante, dans la majeure compatible
+    --major Nom (changement cassant)        -> version majeure suivante (_v1.1 -> _v2.0)
+    une dépendance change de version        -> nouvelle version aussi (cascade)
+    schémas en cycle (A -> B -> A)          -> versionnés ensemble : si l'un change, tous changent
+
+Les références internes (#/components/schemas/Y), y compris dans discriminator.mapping,
+deviennent ../Y/Y_v<x.y>.yaml. Les extensions x-* sont recopiées telles quelles.
+x-sources : celui déclaré sur chaque schéma est conservé ; sinon "<nom du fichier> <info.version>".
+
+Pour repointer ensuite les contrats d'API vers les dernières versions : sync_schemas.py.
+
+Dépendances : PyYAML (pip install pyyaml) et openapi_common.py, à garder à côté de ce script.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from openapi_common import (  # noqa: E402
+    canon, dump, load, map_refs, other_refs, schema_refs, shape, without_sources)
+
+
+# ================================================================ versions sur le disque
+
+@dataclass(frozen=True, order=True)
+class Version:
+    major: int
+    minor: int
+
+    def __str__(self) -> str:
+        return f"{self.major}.{self.minor}"
+
+
+def schema_file(out: Path, name: str, version: Version) -> Path:
+    return out / "schemas" / name / f"{name}_v{version}.yaml"
+
+
+def existing_versions(out: Path, name: str) -> list[Version]:
+    """Versions présentes dans <sortie>/schemas/<Nom>/, de la plus ancienne à la plus récente."""
+    folder = out / "schemas" / name
+    if not folder.is_dir():
+        return []
+    pattern = re.compile(rf"^{re.escape(name)}_v(\d+)\.(\d+)\.yaml$")
+    matches = (pattern.match(f.name) for f in folder.iterdir())
+    return sorted(Version(int(m[1]), int(m[2])) for m in matches if m)
+
+
+# ================================================================ analyse des schémas
+
+def breaking_changes(old, new, at: str = "") -> list[str]:
+    """Changements cassants simples (indicatif) : champ supprimé, devenu obligatoire, type, enum."""
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return []
+    here = at or "racine"
+    prefix = f"{at}." if at else ""
+    found = []
+    if "type" in old and "type" in new and canon(old["type"]) != canon(new["type"]):
+        found.append(f"{here} : type modifié")
+    found += [f'{here} : valeur d\'enum "{v}" retirée' for v in old.get("enum", []) if v not in new.get("enum", [])]
+    found += [f"{prefix}{r} : devenu obligatoire" for r in new.get("required", []) if r not in old.get("required", [])]
+    new_properties = new.get("properties") or {}
+    for key, sub in (old.get("properties") or {}).items():
+        if key not in new_properties:
+            found.append(f"{prefix}{key} : supprimé")
+        else:
+            found += breaking_changes(sub, new_properties[key], f"{prefix}{key}")
+    new_all_of = new.get("allOf") or []
+    for i, sub in enumerate(old.get("allOf") or []):
+        found += breaking_changes(sub, new_all_of[i] if i < len(new_all_of) else None, at)
+    if "items" in old:
+        found += breaking_changes(old["items"], new.get("items"), f"{at}[]")
+    return found
+
+
+def dependency_majors(content, ignore: set[str]) -> set[tuple[str, str]]:
+    """Dépendances d'un contenu avec leur majeure : {("Order", "1"), ...}, hors noms ignorés."""
+    found = re.findall(r"\.\./([^/\"]+)/\1_v(\d+)\.\d+\.yaml", canon(without_sources(content)))
+    return {(name, major) for name, major in found if name not in ignore}
+
+
+def groups_in_dependency_order(graph: dict[str, set[str]]) -> list[list[str]]:
+    """Composantes fortement connexes (algorithme de Tarjan), dépendances d'abord.
+    Un schéma seul forme un groupe d'un élément ; des schémas en cycle (A -> B -> A, ou A -> A)
+    forment un seul groupe. Version itérative : la récursion de Python s'arrête vers 1 000 niveaux,
+    trop peu pour de longues chaînes de dépendances."""
+    edges = {name: sorted(deps) for name, deps in graph.items()}
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    groups: list[list[str]] = []
+
+    for root in edges:
+        if root in index:
+            continue
+        work = [(root, 0)]  # (schéma, prochaine dépendance à examiner) : remplace la pile d'appels
+        while work:
+            node, next_dep = work.pop()
+            if next_dep == 0:
+                index[node] = low[node] = len(index)
+                stack.append(node)
+                on_stack.add(node)
+            descended = False
+            for position in range(next_dep, len(edges[node])):
+                dep = edges[node][position]
+                if dep not in index:
+                    work.append((node, position + 1))  # reprendre ici après la dépendance
+                    work.append((dep, 0))
+                    descended = True
+                    break
+                if dep in on_stack:
+                    low[node] = min(low[node], index[dep])
+            if descended:
+                continue
+            if low[node] == index[node]:  # node est la racine d'un groupe : on le dépile
+                group = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    group.append(member)
+                    if member == node:
+                        break
+                groups.append(sorted(group))
+            if work:  # retour au parent
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+    return groups
+
+
+# ================================================================ lecture et contrôles
+
+def read_schemas(source: Path) -> tuple[dict, str]:
+    """Schémas du fichier et étiquette x-sources par défaut, après contrôle du fichier."""
+    doc = load(source)
+    if not isinstance(doc, dict):
+        raise ValueError(f"{source} n'est pas un fichier YAML OpenAPI")
+    if doc.get("paths") or doc.get("webhooks"):
+        raise ValueError(f"{source} contient des paths : ce script attend un fichier de schémas seulement "
+                         f"(openapi + info + components.schemas).")
+    schemas = (doc.get("components") or {}).get("schemas")
+    if not schemas:
+        raise ValueError(f"{source} : aucun schéma dans components.schemas")
+
+    names = set(schemas)
+    external = other_refs(schemas, names)
+    if external:
+        raise ValueError(f"{source} : {len(external)} référence(s) ne visent pas un schéma du fichier "
+                         f"(ex. {external[0]}). Tous les schémas doivent être dans le fichier.")
+    for name, schema in schemas.items():
+        missing = sorted(schema_refs(schema, names) - names)
+        if missing:
+            raise ValueError(f"{name} référence un schéma absent du fichier : {missing[0]}")
+
+    version = (doc.get("info") or {}).get("version")
+    default_source = f"{source.stem} {version}" if version is not None else source.stem
+    return schemas, default_source
+
+
+# ================================================================ décisions de version
+
+class Splitter:
+    """Décide la version de chaque schéma, sans rien écrire (les écritures sont dans self.writes)."""
+
+    def __init__(self, schemas: dict, out: Path, forced_major: set[str]):
+        self.schemas = schemas
+        self.out = out
+        self.forced = forced_major
+        self.names = set(schemas)
+        self.chosen: dict[str, Version] = {}          # version retenue pour chaque schéma traité
+        self.renewed: set[str] = set()                # schémas qui reçoivent une nouvelle version
+        self.major_bumped: set[str] = set()           # schémas passés à une nouvelle majeure
+        self.writes: list[tuple[str, Version, dict, str | None]] = []  # (Nom, version, contenu, raison ; None = réutilisé)
+        self.warnings: list[str] = []
+        self._versions: dict[str, list[Version]] = {}
+        self._files: dict[tuple[str, Version], dict] = {}
+
+    # -- accès au disque, mis en cache (rien n'est écrit pendant les décisions)
+    def versions(self, name: str) -> list[Version]:
+        if name not in self._versions:
+            self._versions[name] = existing_versions(self.out, name)
+        return self._versions[name]
+
+    def read(self, name: str, version: Version) -> dict:
+        key = (name, version)
+        if key not in self._files:
+            self._files[key] = load(schema_file(self.out, name, version))
+        return self._files[key]
+
+    def latest_in_major(self, name: str, major: int) -> Version:
+        return [v for v in self.versions(name) if v.major == major][-1]
+
+    # -- contenu tel qu'il serait écrit
+    def deps(self, name: str) -> set[str]:
+        return schema_refs(self.schemas[name], self.names)
+
+    def content(self, name: str, undecided: set[str] = frozenset()) -> dict:
+        """Le schéma, ses références pointant vers les versions choisies.
+        undecided : schémas dont la version n'est pas encore choisie (provisoirement v0.0)."""
+        def to_file(dep: str) -> str:
+            version = "0.0" if dep in undecided else self.chosen[dep]
+            return f"../{dep}/{dep}_v{version}.yaml"
+        return without_sources(map_refs(self.schemas[name], self.names, to_file))
+
+    # -- décision pour un groupe : un schéma seul, ou des schémas en cycle
+    def decide(self, group: list[str]) -> None:
+        members = set(group)
+        cyclic = len(group) > 1 or group[0] in self.deps(group[0])
+        draft = {name: self.content(name, undecided=members) for name in group}
+
+        # 1. Tous identiques à une version existante : on les réutilise.
+        matches = {name: self.find_identical(name, draft[name], members) for name in group}
+        if all(matches.values()):
+            for name in group:
+                self.reuse(name, matches[name])
+            return
+
+        # 2. Sinon tous reçoivent une nouvelle version (dans un cycle, ils se référencent mutuellement).
+        is_major = bool(members & self.forced) or any(
+            dep in self.major_bumped for name in group for dep in self.deps(name) - members)
+        existing = [name for name in group if self.versions(name)]
+        previous = self.base_versions(existing, draft, members, is_major)
+        for name in group:
+            if name not in previous:
+                self.chosen[name] = Version(1, 0)
+            elif is_major:
+                self.chosen[name] = Version(previous[name].major + 1, 0)
+                self.major_bumped.add(name)
+            else:
+                self.chosen[name] = Version(previous[name].major, previous[name].minor + 1)
+        self.renewed |= members
+
+        # 3. Contenu définitif, raison et avertissement.
+        label = " ↔ ".join(group)
+        for name in group:
+            content = self.content(name)
+            if name not in previous:
+                reason = "nouveau" + (f", cycle : {label}" if cyclic else "")
+            else:
+                old = self.read(name, previous[name])
+                reason = f"{previous[name]} -> {self.chosen[name]}, {self.why(name, old, content, members, is_major, cyclic)}"
+                if cyclic:
+                    reason += f" ({label})"
+                if not is_major:
+                    self.warn_if_breaking(name, old, content)
+            self.writes.append((name, self.chosen[name], content, reason))
+
+    def find_identical(self, name: str, draft: dict, members: set[str]) -> Version | None:
+        """Version existante identique au brouillon (versions des membres du groupe ignorées)."""
+        if name in self.forced:
+            return None
+        target = shape(draft, only=members)
+        return next((v for v in reversed(self.versions(name)) if shape(self.read(name, v), only=members) == target), None)
+
+    def reuse(self, name: str, match: Version) -> None:
+        """Réutilise la dernière version de la majeure de match (règle « toujours la dernière »)."""
+        target = self.latest_in_major(name, match.major)
+        self.chosen[name] = target
+        self.writes.append((name, target, self.read(name, target), None))
+        if target != match:
+            self.warnings.append(f"{name} : identique à l'ancienne v{match} -> v{target} (dernière de la majeure) "
+                                 f"conservée. Le fichier contenait une copie périmée de ce schéma.")
+
+    def base_versions(self, group: list[str], draft: dict, members: set[str], is_major: bool) -> dict[str, Version]:
+        """Version de départ de chaque membre pour sa nouvelle version.
+        Majeure : la plus haute existante. Mineure : la dernière version d'une ligne majeure
+        commune à tout le groupe (un cycle reste dans une seule ligne) ; voir candidate_majors."""
+        if is_major:
+            return {name: self.versions(name)[-1] for name in group}
+        candidates = {name: self.candidate_majors(name, draft[name], members) for name in group}
+        common = [m for m in candidates[group[0]] if all(m in c for c in candidates.values())] if group else []
+        return {name: self.latest_in_major(name, common[0] if common else candidates[name][0]) for name in group}
+
+    def candidate_majors(self, name: str, draft: dict, members: set[str]) -> list[int]:
+        """Lignes majeures où le nouveau contenu peut prendre place, de la meilleure à la moins bonne :
+        celles dont la dernière version a les mêmes majeures de dépendances et vis-à-vis de laquelle
+        le changement n'est pas cassant, en commençant par la plus haute.
+        Ex. : on fait évoluer Order 1.1 alors que Order_v2.0 existe -> ligne 1, donc Order_v1.2."""
+        majors = sorted({v.major for v in self.versions(name)}, reverse=True)
+        latest = {m: self.read(name, self.latest_in_major(name, m)) for m in majors}
+        wanted = dependency_majors(draft, ignore=members)
+        same_deps = [m for m in majors if dependency_majors(latest[m], ignore=members) == wanted] or majors
+        compatible = [m for m in same_deps if not breaking_changes(latest[m], draft)]
+        return compatible + [m for m in same_deps if m not in compatible]
+
+    def why(self, name: str, old: dict, new: dict, members: set[str], is_major: bool, cyclic: bool) -> str:
+        if name in self.forced:
+            return "changement cassant (--major)"
+        if shape(old) == shape(new):  # seules les versions des références ont changé
+            changed = sorted((self.deps(name) - members) & self.renewed)
+            cause = f"cascade : {', '.join(changed)}" if changed else "cascade dans le cycle"
+            return cause + (" (majeure)" if is_major else "")
+        if is_major:
+            return "contenu modifié + " + ("cycle passé en majeure" if cyclic else "dépendance passée en majeure")
+        return "contenu modifié"
+
+    def warn_if_breaking(self, name: str, old: dict, new: dict) -> None:
+        breaking = breaking_changes(old, new)
+        if breaking:
+            self.warnings.append(f"{name}_v{self.chosen[name]} semble cassant ({' ; '.join(breaking)}). "
+                                 f"Si c'est voulu, relancez avec --major {name} (et --dry-run pour vérifier).")
+
+    def run(self) -> None:
+        graph = {name: self.deps(name) for name in self.schemas}
+        for group in groups_in_dependency_order(graph):
+            self.decide(group)
+
+
+# ================================================================ écriture et rapport
+
+def split(source: Path, out: Path, forced_major: set[str], dry_run: bool) -> None:
+    schemas, default_source = read_schemas(source)
+    unknown = forced_major - schemas.keys()
+    if unknown:
+        raise ValueError(f"--major : schéma(s) absent(s) du fichier : {', '.join(sorted(unknown))}")
+
+    splitter = Splitter(schemas, out, forced_major)
+    splitter.run()
+
+    if not dry_run:
+        for name, version, content, _ in splitter.writes:
+            declared = schemas[name].get("x-sources") if isinstance(schemas[name], dict) else None
+            sources = list(dict.fromkeys([*(content.get("x-sources") or []), *(declared or [default_source])]))
+            path = schema_file(out, name, version)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(dump({**without_sources(content), "x-sources": sources}), encoding="utf-8")
+
+    created = [(name, version, reason) for name, version, _, reason in splitter.writes if reason]
+    reused = [f"{name}_v{version}" for name, version, _, reason in splitter.writes if not reason]
+    print(f"{'[simulation] ' if dry_run else ''}✔ {source} -> {out / 'schemas'}/")
+    for name, version, reason in created:
+        print(f"  + {name}/{name}_v{version}.yaml  ({reason})")
+    if reused:
+        shown = ", ".join(reused[:30]) + (f", … (+{len(reused) - 30})" if len(reused) > 30 else "")
+        print(f"  = réutilisés ({len(reused)}) : {shown}")
+    for warning in splitter.warnings:
+        print(f"  ⚠ {warning}")
+    if any(not reason.startswith("nouveau") for _, _, reason in created):
+        print("  → Lancez sync_schemas.py pour repointer les contrats vers ces nouvelles versions.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Découpe un fichier de schémas OpenAPI en schemas/<Nom>/<Nom>_v<x.y>.yaml.")
+    parser.add_argument("source", type=Path, help="fichier de schémas (openapi + info + components.schemas)")
+    parser.add_argument("out", type=Path, help="dossier de sortie (les schémas vont dans <sortie>/schemas/)")
+    parser.add_argument("--major", default="", help="schémas ayant un changement cassant, séparés par des virgules")
+    parser.add_argument("--dry-run", action="store_true", help="affiche ce qui serait fait sans rien écrire")
+    args = parser.parse_args()
+    try:
+        split(args.source, args.out, {n for n in args.major.split(",") if n}, args.dry_run)
+    except (ValueError, OSError, yaml.YAMLError) as error:
+        print(f"✖ {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
