@@ -3,10 +3,21 @@
 Découpe un fichier de schémas OpenAPI (components.schemas, sans paths) en un fichier
 par schéma et par version :
 
-    <sortie>/schemas/<Nom>/<Nom>_v<x>.<y>.yaml
+    <dossier des schémas>/<Nom>/<Nom>_V<x>.<y>.yaml
+
+Renommage (voir openapi_common.schema_naming) :
+    préfixe retiré (S_, E_, A_ …), séparateurs supprimés, PascalCase, puis suffixe :
+    S_ActorCompany -> ActorCompanyObject, E_ActorComposite_Input -> ActorCompositeInput,
+    E_Actor_Output -> ActorOutput. Deux schémas qui donneraient le même nom : erreur.
+
+Chaque fichier contient un en-tête (date, fichier source), un bloc info (title = nom,
+description selon Object / Input / Output, version x.y.0) et components.schemas.<Nom>.
 
 Usage :
-    python3 split_openapi.py <schemas.yaml> <dossier-sortie> [--major Nom,Nom] [--dry-run]
+    python3 split_openapi.py [schemas.yaml] [dossier-des-schémas] [--major Nom,Nom] [--dry-run]
+
+    Sans argument : SOURCE_FILE et SCHEMAS_DIR de openapi_common.py (configuration du projet).
+    Le dossier des schémas est créé automatiquement.
 
 Versionnement automatique :
     schéma nouveau                          -> _v1.0
@@ -17,8 +28,8 @@ Versionnement automatique :
     schémas en cycle (A -> B -> A)          -> versionnés ensemble : si l'un change, tous changent
 
 Les références internes (#/components/schemas/Y), y compris dans discriminator.mapping,
-deviennent ../Y/Y_v<x.y>.yaml. Les extensions x-* sont recopiées telles quelles.
-x-sources : celui déclaré sur chaque schéma est conservé ; sinon "<nom du fichier> <info.version>".
+deviennent ../NouveauNom/NouveauNom_V<x.y>.yaml#/components/schemas/NouveauNom.
+Les extensions x-* sont recopiées telles quelles.
 
 Pour repointer ensuite les contrats d'API vers les dernières versions : sync_schemas.py.
 
@@ -31,13 +42,15 @@ import argparse
 import re
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openapi_common import (  # noqa: E402
-    canon, dump, load, map_refs, other_refs, schema_refs, shape, without_sources)
+    DESCRIPTIONS, LOCAL, SCHEMAS_DIR, SOURCE_FILE, breaking_changes, canon, dump, load, map_refs, other_refs, rename_map, schema_naming, schema_refs,
+    shape, without_sources)
 
 
 # ================================================================ versions sur le disque
@@ -51,50 +64,35 @@ class Version:
         return f"{self.major}.{self.minor}"
 
 
-def schema_file(out: Path, name: str, version: Version) -> Path:
-    return out / "schemas" / name / f"{name}_v{version}.yaml"
+def file_name(name: str, version) -> str:
+    return f"{name}_V{version}.yaml"
 
 
-def existing_versions(out: Path, name: str) -> list[Version]:
-    """Versions présentes dans <sortie>/schemas/<Nom>/, de la plus ancienne à la plus récente."""
-    folder = out / "schemas" / name
+def fragment(name: str) -> str:
+    """Le schéma est dans components.schemas.<Nom> de son fichier : une $ref doit y pointer,
+    sinon elle désigne tout le document (info compris)."""
+    return f"#/components/schemas/{name}"
+
+
+def schema_file(schemas_dir: Path, name: str, version: Version) -> Path:
+    return schemas_dir / name / file_name(name, version)
+
+
+def existing_versions(schemas_dir: Path, name: str) -> list[Version]:
+    """Versions présentes dans <dossier des schémas>/<Nom>/, de la plus ancienne à la plus récente."""
+    folder = schemas_dir / name
     if not folder.is_dir():
         return []
-    pattern = re.compile(rf"^{re.escape(name)}_v(\d+)\.(\d+)\.yaml$")
+    pattern = re.compile(rf"^{re.escape(name)}_V(\d+)\.(\d+)\.yaml$")
     matches = (pattern.match(f.name) for f in folder.iterdir())
     return sorted(Version(int(m[1]), int(m[2])) for m in matches if m)
 
 
 # ================================================================ analyse des schémas
 
-def breaking_changes(old, new, at: str = "") -> list[str]:
-    """Changements cassants simples (indicatif) : champ supprimé, devenu obligatoire, type, enum."""
-    if not isinstance(old, dict) or not isinstance(new, dict):
-        return []
-    here = at or "racine"
-    prefix = f"{at}." if at else ""
-    found = []
-    if "type" in old and "type" in new and canon(old["type"]) != canon(new["type"]):
-        found.append(f"{here} : type modifié")
-    found += [f'{here} : valeur d\'enum "{v}" retirée' for v in old.get("enum", []) if v not in new.get("enum", [])]
-    found += [f"{prefix}{r} : devenu obligatoire" for r in new.get("required", []) if r not in old.get("required", [])]
-    new_properties = new.get("properties") or {}
-    for key, sub in (old.get("properties") or {}).items():
-        if key not in new_properties:
-            found.append(f"{prefix}{key} : supprimé")
-        else:
-            found += breaking_changes(sub, new_properties[key], f"{prefix}{key}")
-    new_all_of = new.get("allOf") or []
-    for i, sub in enumerate(old.get("allOf") or []):
-        found += breaking_changes(sub, new_all_of[i] if i < len(new_all_of) else None, at)
-    if "items" in old:
-        found += breaking_changes(old["items"], new.get("items"), f"{at}[]")
-    return found
-
-
 def dependency_majors(content, ignore: set[str]) -> set[tuple[str, str]]:
     """Dépendances d'un contenu avec leur majeure : {("Order", "1"), ...}, hors noms ignorés."""
-    found = re.findall(r"\.\./([^/\"]+)/\1_v(\d+)\.\d+\.yaml", canon(without_sources(content)))
+    found = re.findall(r"\.\./([^/\"]+)/\1_[vV](\d+)\.\d+\.yaml", canon(without_sources(content)))
     return {(name, major) for name, major in found if name not in ignore}
 
 
@@ -149,8 +147,12 @@ def groups_in_dependency_order(graph: dict[str, set[str]]) -> list[list[str]]:
 
 # ================================================================ lecture et contrôles
 
-def read_schemas(source: Path) -> tuple[dict, str]:
-    """Schémas du fichier et étiquette x-sources par défaut, après contrôle du fichier."""
+def read_schemas(source: Path) -> dict:
+    """Schémas du fichier, contrôlés puis renommés : {NouveauNom: schéma}, dont les références
+    internes visent déjà les nouveaux noms."""
+    if not source.is_file():
+        raise ValueError(f"Fichier de schémas introuvable : {source.resolve()} "
+                         f"(lancez le script depuis la racine du projet, ou adaptez SOURCE_FILE dans openapi_common.py)")
     doc = load(source)
     if not isinstance(doc, dict):
         raise ValueError(f"{source} n'est pas un fichier YAML OpenAPI")
@@ -171,9 +173,9 @@ def read_schemas(source: Path) -> tuple[dict, str]:
         if missing:
             raise ValueError(f"{name} référence un schéma absent du fichier : {missing[0]}")
 
-    version = (doc.get("info") or {}).get("version")
-    default_source = f"{source.stem} {version}" if version is not None else source.stem
-    return schemas, default_source
+    new_names = rename_map(schemas)
+    return {new_names[name]: without_sources(map_refs(schema, names, lambda dep: LOCAL + new_names[dep]))
+            for name, schema in schemas.items()}
 
 
 # ================================================================ décisions de version
@@ -203,7 +205,8 @@ class Splitter:
     def read(self, name: str, version: Version) -> dict:
         key = (name, version)
         if key not in self._files:
-            self._files[key] = load(schema_file(self.out, name, version))
+            doc = load(schema_file(self.out, name, version))
+            self._files[key] = doc["components"]["schemas"][name]
         return self._files[key]
 
     def latest_in_major(self, name: str, major: int) -> Version:
@@ -218,7 +221,7 @@ class Splitter:
         undecided : schémas dont la version n'est pas encore choisie (provisoirement v0.0)."""
         def to_file(dep: str) -> str:
             version = "0.0" if dep in undecided else self.chosen[dep]
-            return f"../{dep}/{dep}_v{version}.yaml"
+            return f"../{dep}/{file_name(dep, version)}{fragment(dep)}"
         return without_sources(map_refs(self.schemas[name], self.names, to_file))
 
     # -- décision pour un groupe : un schéma seul, ou des schémas en cycle
@@ -316,7 +319,7 @@ class Splitter:
     def warn_if_breaking(self, name: str, old: dict, new: dict) -> None:
         breaking = breaking_changes(old, new)
         if breaking:
-            self.warnings.append(f"{name}_v{self.chosen[name]} semble cassant ({' ; '.join(breaking)}). "
+            self.warnings.append(f"{name}_V{self.chosen[name]} semble cassant ({' ; '.join(breaking)}). "
                                  f"Si c'est voulu, relancez avec --major {name} (et --dry-run pour vérifier).")
 
     def run(self) -> None:
@@ -327,42 +330,62 @@ class Splitter:
 
 # ================================================================ écriture et rapport
 
-def split(source: Path, out: Path, forced_major: set[str], dry_run: bool) -> None:
-    schemas, default_source = read_schemas(source)
-    unknown = forced_major - schemas.keys()
-    if unknown:
-        raise ValueError(f"--major : schéma(s) absent(s) du fichier : {', '.join(sorted(unknown))}")
+BANNER = "#" * 62
+BANNER_TITLE = ("#" + "Schema file information".center(60)).rstrip()
 
-    splitter = Splitter(schemas, out, forced_major)
+
+def render(name: str, version: Version, content: dict, source: Path) -> str:
+    """Texte d'un fichier de schéma : en-tête, info, components.schemas.<Nom>."""
+    _, base, kind = schema_naming(name)
+    header = (f"# created on: {date.today():%d/%m/%Y} split from {source.name}\n\n"
+              f"{BANNER}\n{BANNER_TITLE}\n{BANNER}\n\n")
+    info = (f"info:\n"
+            f"    title: {name}\n"
+            f"    description: >\n"
+            f"        {DESCRIPTIONS[kind].format(base=base)}\n"
+            f"    version: {version}.0\n\n\n")
+    body = dump({"components": {"schemas": {name: content}}}, indent=4)
+    body = re.sub(r"^(\s*(?:-\s+)?\$ref: )(\.\./\S+)$", r"\1'\2'", body, flags=re.M)  # $ref: '../X/X_V1.0.yaml#/…'
+    return header + info + body
+
+
+def split(source: Path, out: Path, forced_major: set[str], dry_run: bool) -> None:
+    schemas = read_schemas(source)
+    forced = {schema_naming(name)[0] for name in forced_major}  # --major accepte l'ancien ou le nouveau nom
+    unknown = sorted(name for name in forced_major if schema_naming(name)[0] not in schemas)
+    if unknown:
+        raise ValueError(f"--major : schéma(s) absent(s) du fichier : {', '.join(unknown)}")
+
+    splitter = Splitter(schemas, out, forced)
     splitter.run()
 
+    created = [(name, version, content, reason) for name, version, content, reason in splitter.writes if reason]
     if not dry_run:
-        for name, version, content, _ in splitter.writes:
-            declared = schemas[name].get("x-sources") if isinstance(schemas[name], dict) else None
-            sources = list(dict.fromkeys([*(content.get("x-sources") or []), *(declared or [default_source])]))
+        for name, version, content, _ in created:  # une version réutilisée n'est jamais réécrite
             path = schema_file(out, name, version)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(dump({**without_sources(content), "x-sources": sources}), encoding="utf-8")
+            path.write_text(render(name, version, content, source), encoding="utf-8")
 
-    created = [(name, version, reason) for name, version, _, reason in splitter.writes if reason]
-    reused = [f"{name}_v{version}" for name, version, _, reason in splitter.writes if not reason]
-    print(f"{'[simulation] ' if dry_run else ''}✔ {source} -> {out / 'schemas'}/")
-    for name, version, reason in created:
-        print(f"  + {name}/{name}_v{version}.yaml  ({reason})")
+    reused = [file_name(name, version)[:-5] for name, version, _, reason in splitter.writes if not reason]
+    print(f"{'[simulation] ' if dry_run else ''}✔ {source} -> {out}/")
+    for name, version, _, reason in created:
+        print(f"  + {name}/{file_name(name, version)}  ({reason})")
     if reused:
         shown = ", ".join(reused[:30]) + (f", … (+{len(reused) - 30})" if len(reused) > 30 else "")
         print(f"  = réutilisés ({len(reused)}) : {shown}")
     for warning in splitter.warnings:
         print(f"  ⚠ {warning}")
-    if any(not reason.startswith("nouveau") for _, _, reason in created):
+    if any(not reason.startswith("nouveau") for *_, reason in created):
         print("  → Lancez sync_schemas.py pour repointer les contrats vers ces nouvelles versions.")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Découpe un fichier de schémas OpenAPI en schemas/<Nom>/<Nom>_v<x.y>.yaml.")
-    parser.add_argument("source", type=Path, help="fichier de schémas (openapi + info + components.schemas)")
-    parser.add_argument("out", type=Path, help="dossier de sortie (les schémas vont dans <sortie>/schemas/)")
+        description="Découpe un fichier de schémas OpenAPI en <dossier des schémas>/<Nom>/<Nom>_V<x.y>.yaml.")
+    parser.add_argument("source", type=Path, nargs="?", default=SOURCE_FILE,
+                        help=f"fichier de schémas en bloc (défaut : {SOURCE_FILE})")
+    parser.add_argument("out", type=Path, nargs="?", default=SCHEMAS_DIR,
+                        help=f"dossier des schémas, créé si besoin (défaut : {SCHEMAS_DIR})")
     parser.add_argument("--major", default="", help="schémas ayant un changement cassant, séparés par des virgules")
     parser.add_argument("--dry-run", action="store_true", help="affiche ce qui serait fait sans rien écrire")
     args = parser.parse_args()
