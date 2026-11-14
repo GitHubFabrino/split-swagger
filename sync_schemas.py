@@ -25,7 +25,8 @@ Usage :
     python3 sync_schemas.py [api.yaml ...] [--schemas-dir D] [--apis-dir D] [--dry-run | --check | --watch [S]]
 
     Sans argument : SCHEMAS_DIR et APIS_DIR de openapi_common.py (configuration du projet).
-    api.yaml ...   API à traiter (défaut : toutes les <dossier des API>/<api>/v<x>/<api>.yaml)
+    api.yaml ...   API à traiter (défaut : la dernière version de chaque <dossier des API>/<api>/v<x>/<api>.yaml ;
+                   les anciennes versions ne sont jamais modifiées)
     --dry-run      affiche les changements sans rien écrire
     --check        n'écrit rien ; code 1 si une API n'est pas à jour ou si une $ref est cassée (CI)
     --watch        synchronise automatiquement à chaque modification (défaut : toutes les 2 s)
@@ -291,17 +292,19 @@ def update_changelog(catalog: Catalog, name: str, write: bool) -> list[str]:
 
 # ================================================================ découverte et contrôles
 
-def discover_apis(apis_dir: Path, schemas_dir: Path) -> list[Path]:
-    """Toutes les <dossier des API>/<api>/v<x>/<api>.yaml (le dossier des schémas est ignoré)."""
+def discover_apis(apis_dir: Path, schemas_dir: Path) -> tuple[list[Path], list[Path]]:
+    """API de <dossier des API>/<api>/v<x>/<api>.yaml : (dernière version de chaque API, anciennes versions).
+    Seule la dernière version est traitée : les anciennes restent figées."""
     if not apis_dir.is_dir():
         raise ValueError(f"Dossier des API introuvable : {apis_dir.resolve()} (adaptez APIS_DIR dans openapi_common.py)")
-    found = []
+    latest, older = [], []
     for api in sorted(p for p in apis_dir.iterdir() if p.is_dir() and p.resolve() != schemas_dir.resolve()):
-        for version_dir in sorted(p for p in api.iterdir() if p.is_dir() and re.fullmatch(r"v\d+", p.name)):
-            file = version_dir / f"{api.name}.yaml"
-            if file.exists():
-                found.append(file)
-    return found
+        versions = sorted((int(d.name[1:]), d / f"{api.name}.yaml") for d in api.iterdir()
+                          if d.is_dir() and re.fullmatch(r"v\d+", d.name) and (d / f"{api.name}.yaml").exists())
+        if versions:
+            latest.append(versions[-1][1])
+            older += [file for _, file in versions[:-1]]
+    return latest, older
 
 
 def broken_refs(files: list[Path], root: Path) -> list[str]:
@@ -332,40 +335,55 @@ def broken_refs(files: list[Path], root: Path) -> list[str]:
 
 
 def run(schemas_dir: Path, apis_dir: Path, apis: list[Path], mode: str) -> int:
-    """mode : write | dry-run | check. Renvoie le code de sortie."""
+    """mode : write | dry-run | check. Renvoie le code de sortie.
+    Sans API donnée : dernière version de chaque API de apis_dir."""
     catalog = Catalog(schemas_dir)
-    targets = apis or discover_apis(apis_dir, schemas_dir)
+    targets, older = (apis, []) if apis else discover_apis(apis_dir, schemas_dir)
     root = apis_dir
-    changes: dict[str, list[str]] = {}
-    errors: list[str] = []
+    tag = {"dry-run": "[simulation] ", "check": "[contrôle] "}.get(mode, "")
+
+    # Une ligne par API : à jour, mise à jour, ou erreur.
+    results = []
     for api in targets:
         api_changes, api_errors = sync_api(api, catalog, mode == "write", root)
-        if api_changes:
-            changes[display(api, root)] = api_changes
-        errors += api_errors
+        results.append((display(api, root), api_changes, api_errors))
+    updated = sum(1 for _, changes, errors in results if changes and not errors)
+    failed = sum(1 for _, _, errors in results if errors)
+    print(f"{tag}Synchronisation de {len(targets)} API (dernière version de chaque API) :")
+    for label, changes, errors in results:
+        if errors:
+            print(f"  ✖ {label} : {len(errors)} erreur(s), API non modifiée")
+            for error in dict.fromkeys(errors):
+                print(f"      ✖ {error.split(' : ', 1)[1] if error.startswith(label + ' : ') else error}")
+        elif changes:
+            verb = "à mettre à jour" if mode == "check" else "mise à jour" if mode == "write" else "serait mise à jour"
+            print(f"  ↑ {label} : {verb}")
+            for change in dict.fromkeys(changes):
+                print(f"      ↑ {change}")
+        else:
+            print(f"  ✔ {label} : à jour")
+    if older:
+        print(f"  · anciennes versions ignorées ({len(older)}) : "
+              + ", ".join(display(file.parent, root) for file in older))
+
+    errors = []
     if mode in ("write", "check"):
-        errors += broken_refs(targets + catalog.files(), root)
+        errors = broken_refs(targets + catalog.files(), root)
+        if errors:
+            print(f"{tag}✖ Références cassées :")
+            for error in errors:
+                print(f"  ✖ {error}")
     changelogs = {name: added for name in sorted(catalog.versions)
                   if (added := update_changelog(catalog, name, write=mode == "write"))}
-
-    tag = {"dry-run": "[simulation] ", "check": "[contrôle] "}.get(mode, "")
-    if changes:
-        print(f"{tag}{'Mises à jour nécessaires' if mode == 'check' else 'Synchronisé'} ({len(targets)} API) :")
-        for api, items in changes.items():
-            print(f"  {api}")
-            for item in dict.fromkeys(items):
-                print(f"    ↑ {item}")
-    elif not errors:
-        print(f"{tag}✔ {len(targets)} API à jour avec les dernières versions des schémas")
     if changelogs:
         print(f"{tag}{'Changelog à compléter' if mode == 'check' else 'Changelog mis à jour'} :")
         for name, added in changelogs.items():
             print(f"  {name}/{CHANGELOG} : + {', '.join(added)}")
-    if errors:
-        print(f"{tag}✖ Erreurs :", file=sys.stderr)
-        for error in dict.fromkeys(errors):
-            print(f"  ✖ {error}", file=sys.stderr)
-    return 1 if errors or (mode == "check" and (changes or changelogs)) else 0
+
+    print(f"{tag}Bilan : {len(targets) - updated - failed} à jour, {updated} "
+          f"{'à mettre à jour' if mode == 'check' else 'mise(s) à jour'}, {failed} en erreur"
+          + (f", {len(errors)} référence(s) cassée(s)" if errors else ""))
+    return 1 if failed or errors or (mode == "check" and (updated or changelogs)) else 0
 
 
 # ================================================================ mode --watch
