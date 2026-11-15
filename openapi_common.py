@@ -24,8 +24,9 @@ import yaml
 # À adapter une fois. Chemins relatifs au dossier depuis lequel on lance les scripts
 # (la racine du projet, ex. wma-api-gouv-RDV/). Chacun peut être remplacé en ligne de commande.
 
-SOURCE_FILE = Path("swaggers/RDV/schemas/rdv-actor-schemas.yaml")  # fichier de schémas en bloc à découper
-SCHEMAS_DIR = Path("swaggers/RDV/schema")                           # sortie : un dossier par schéma (créé automatiquement)
+SOURCE_FILE = Path("swaggers/RDV/schemas/rdv-actor-schemas.yaml")  # fichier de composants en bloc à découper
+COMPONENTS_DIR = Path("swaggers/RDV/components")                    # sortie (créée automatiquement) :
+SCHEMAS_DIR = COMPONENTS_DIR / "schemas"                            #   components/<section>/<Nom>/<Nom>_V<x.y>.yaml
 APIS_DIR = Path("swaggers/RDV")                                     # où chercher les API : <api>/v<x>/<api>.yaml
 
 # ================================================================ YAML 1.2
@@ -131,6 +132,17 @@ def dump(obj, indent: int = 2) -> str:
 
 LOCAL = "#/components/schemas/"
 
+# Sections de components découpées, dans l'ordre de traitement : une section ne peut référencer
+# que les sections qui la précèdent (ou elle-même). securitySchemes ne référence rien.
+SECTIONS = ("schemas", "parameters", "responses", "securitySchemes")
+SECTION_KIND = {"parameters": "Parameter", "responses": "Response", "securitySchemes": "SecurityScheme"}
+SECTION_TITLE = {"schemas": "Schema", "parameters": "Parameter", "responses": "Response",
+                 "securitySchemes": "Security scheme"}
+
+
+def local_prefix(section: str) -> str:
+    return f"#/components/{section}/"
+
 # Extensions x-* : annotations libres, recopiées telles quelles. Exception : celles-ci, dont
 # les $ref sont résolues par les outils (x-webhooks = webhooks d'OpenAPI 3.0).
 RESOLVED_EXTENSIONS = {"x-webhooks"}
@@ -143,27 +155,28 @@ def is_annotation(key) -> bool:
     return isinstance(key, str) and key.startswith("x-") and key not in RESOLVED_EXTENSIONS
 
 
-def _schema_name(value, names: set, bare_allowed: bool) -> str | None:
-    """Nom du schéma visé par une référence, ou None si elle ne vise pas un schéma du fichier.
-    bare_allowed : un nom seul (« Cat ») est accepté, ce que permet discriminator.mapping."""
+def _schema_name(value, names: set, bare_allowed: bool, prefix: str = LOCAL) -> str | None:
+    """Nom du composant visé par une référence, ou None si elle ne vise pas un composant du fichier.
+    bare_allowed : un nom seul (« Cat ») est accepté, ce que permet discriminator.mapping (schémas)."""
     if not isinstance(value, str):
         return None
-    if value.startswith(LOCAL):
-        return value[len(LOCAL):]
-    if bare_allowed and value in names:
+    if value.startswith(prefix):
+        return value[len(prefix):]
+    if bare_allowed and prefix == LOCAL and value in names:
         return value
     return None
 
 
 def map_refs(node, names: set, local: Callable[[str], str],
-             other: Callable[[str], None] | None = None):
+             other: Callable[[str], None] | None = None, prefix: str = LOCAL):
     """Parcourt node et renvoie une copie où chaque référence vers un schéma local
     ($ref ou valeur de discriminator.mapping) est remplacée par local(nom).
     other(valeur) est appelé pour chaque autre référence (fichier externe, autre composant).
-    Les extensions x-* (sauf RESOLVED_EXTENSIONS) sont recopiées sans être parcourues."""
+    Les extensions x-* (sauf RESOLVED_EXTENSIONS) sont recopiées sans être parcourues.
+    prefix : section visée (#/components/schemas/ par défaut, ou #/components/parameters/ …)."""
 
     def replace(value, bare_allowed: bool):
-        name = _schema_name(value, names, bare_allowed)
+        name = _schema_name(value, names, bare_allowed, prefix)
         if name is not None:
             return local(name)
         if other and isinstance(value, str):
@@ -171,7 +184,7 @@ def map_refs(node, names: set, local: Callable[[str], str],
         return value
 
     if isinstance(node, list):
-        return [map_refs(item, names, local, other) for item in node]
+        return [map_refs(item, names, local, other, prefix) for item in node]
     if not isinstance(node, dict):
         return node
 
@@ -187,29 +200,29 @@ def map_refs(node, names: set, local: Callable[[str], str],
                 if d_key == "mapping":
                     discriminator[d_key] = {k: replace(v, bare_allowed=True) for k, v in d_value.items()}
                 else:
-                    discriminator[d_key] = map_refs(d_value, names, local, other)
+                    discriminator[d_key] = map_refs(d_value, names, local, other, prefix)
             copy[key] = discriminator
         else:
-            copy[key] = map_refs(value, names, local, other)
+            copy[key] = map_refs(value, names, local, other, prefix)
     return copy
 
 
-def schema_refs(node, names: set) -> set[str]:
-    """Noms des schémas locaux référencés par node."""
+def schema_refs(node, names: set, prefix: str = LOCAL) -> set[str]:
+    """Noms des composants locaux (de la section prefix) référencés par node."""
     found: set[str] = set()
 
     def remember(name: str) -> str:
         found.add(name)
         return name
 
-    map_refs(node, names, remember)
+    map_refs(node, names, remember, prefix=prefix)
     return found
 
 
-def other_refs(node, names: set) -> list[str]:
-    """Références qui ne visent pas un schéma local (fichier externe, autre composant…)."""
+def other_refs(node, names: set, prefix: str = LOCAL) -> list[str]:
+    """Références qui ne visent pas un composant local (fichier externe, autre section…)."""
     found: list[str] = []
-    map_refs(node, names, lambda name: name, other=found.append)
+    map_refs(node, names, lambda name: name, other=found.append, prefix=prefix)
     return found
 
 
@@ -394,6 +407,9 @@ DESCRIPTIONS = {
     "Object": "{base} - shared object, reused by Input/Output schemas",
     "Input": "{base} - request payload (create / update)",
     "Output": "{base} - response payload",
+    "Parameter": "{base} - reusable request parameter",
+    "Response": "{base} - reusable response",
+    "SecurityScheme": "{base} - security scheme",
 }
 
 _PREFIX = re.compile(r"^[A-Z]+_")                      # S_, E_, A_ …
@@ -469,18 +485,29 @@ def renamed_for_api(new_name: str, base: str, api: str) -> tuple[str, str]:
 
 # Référence vers un schéma d'un autre fichier .yaml qui n'est pas un fichier de schéma découpé,
 # ex. ../../schemas/rdv-actor-schemas.yaml#/components/schemas/S_ExternalId (fichier commun en bloc).
-_BLOCK_REF = re.compile(r"^(?P<file>[^#]+\.ya?ml)#/components/schemas/(?P<name>[^/#]+)$")
+_BLOCK_REF = re.compile(r"^(?P<file>[^#]+\.ya?ml)#/components/(?P<section>[A-Za-z]+)/(?P<name>[^/#]+)$")
 _SPLIT_FILE = re.compile(r"(?:^|/)(?P<name>[^/]+)/(?P=name)_[vV]\d+\.\d+\.yaml$")
 
 
-def block_ref_schema(ref) -> str | None:
-    """Nom d'origine du schéma visé si ref pointe vers un fichier en bloc (pas un fichier découpé)."""
+def block_ref(ref) -> tuple[str, str] | None:
+    """(section, nom d'origine) visés si ref pointe vers un fichier en bloc (pas un fichier découpé)."""
     if not isinstance(ref, str):
         return None
     m = _BLOCK_REF.match(ref)
     if not m or _SPLIT_FILE.search(m["file"].replace("\\", "/")):
         return None
-    return m["name"]
+    return m["section"], m["name"]
+
+
+def block_ref_schema(ref) -> str | None:
+    """Nom d'origine du schéma visé si ref pointe vers un schéma d'un fichier en bloc."""
+    found = block_ref(ref)
+    return found[1] if found and found[0] == "schemas" else None
+
+
+def disk_name(section: str, name: str) -> str:
+    """Nom sur disque d'un composant : renommage pour les schémas, nom inchangé pour les autres sections."""
+    return schema_naming(name)[0] if section == "schemas" else name
 
 
 def map_block_refs(node, to_ref):
@@ -496,7 +523,7 @@ def map_block_refs(node, to_ref):
 
 # Référence vers un fichier de schéma découpé : …/Nom/Nom_V1.2.yaml(#/components/schemas/Nom)
 SCHEMA_FILE_REF = re.compile(
-    r"(?:^|[\\/])(?P<name>[^/\\#]+)[\\/](?P=name)_[vV](?P<version>\d+\.\d+)\.yaml(?:#/components/schemas/(?P=name))?$")
+    r"(?:^|[\\/])(?P<name>[^/\\#]+)[\\/](?P=name)_[vV](?P<version>\d+\.\d+)\.yaml(?:#/components/[A-Za-z]+/(?P=name))?$")
 
 
 def to_sibling_refs(node):

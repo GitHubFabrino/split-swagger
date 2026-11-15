@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
 """
-Découpe un fichier de schémas OpenAPI (components.schemas, sans paths) en un fichier
-par schéma et par version :
+Découpe un fichier de composants OpenAPI en bloc (components, sans paths) en un fichier
+par composant et par version :
 
-    <dossier des schémas>/<Nom>/<Nom>_V<x>.<y>.yaml
+    <components>/schemas/<Nom>/<Nom>_V<x>.<y>.yaml
+    <components>/parameters/<Nom>/<Nom>_V<x>.<y>.yaml
+    <components>/responses/<Nom>/<Nom>_V<x>.<y>.yaml
+    <components>/securitySchemes/<Nom>/<Nom>_V<x>.<y>.yaml
 
-Renommage (voir openapi_common.schema_naming) :
+Renommage des schémas (voir openapi_common.schema_naming) :
     préfixe retiré (S_, E_, A_ …), séparateurs supprimés, PascalCase, puis suffixe :
     S_ActorCompany -> ActorCompanyObject, E_ActorComposite_Input -> ActorCompositeInput,
     E_Actor_Output -> ActorOutput. Deux schémas qui donneraient le même nom : erreur.
+Parameters, responses et securitySchemes gardent leur nom.
 
 Chaque fichier contient un en-tête (date, fichier source), un bloc info (title = nom,
-description selon Object / Input / Output, version x.y.0) et components.schemas.<Nom>.
+description selon le type, version x.y.0) et components.<section>.<Nom>.
+Les références vers une autre section deviennent ../../<section>/<Nom>/<Nom>_V<x.y>.yaml#/components/<section>/<Nom>
+(ex. une response vers son schéma d'erreur). Les autres sections (examples, headers…) restent dans
+le fichier en bloc ; les références vers elles y pointent.
 
 Usage :
-    python3 split_openapi.py [schemas.yaml] [dossier-des-schémas] [--major Nom,Nom] [--dry-run]
+    python3 split_openapi.py [composants.yaml] [dossier-components] [--major Nom,Nom] [--dry-run]
 
-    Sans argument : SOURCE_FILE et SCHEMAS_DIR de openapi_common.py (configuration du projet).
-    Le dossier des schémas est créé automatiquement.
+    Sans argument : SOURCE_FILE et COMPONENTS_DIR de openapi_common.py (configuration du projet).
+    Le dossier components est créé automatiquement.
 
 Versionnement automatique :
     schéma nouveau                          -> _v1.0
     identique à une version existante       -> réutilisée (la dernière de sa majeure)
     modifié                                 -> version mineure suivante, dans la majeure compatible
     --major Nom (changement cassant)        -> version majeure suivante (_v1.1 -> _v2.0)
-    une dépendance change de version        -> nouvelle version aussi (cascade)
+    une dépendance change de version        -> nouvelle version aussi (cascade, y compris
+                                               d'une section à l'autre : schéma -> response)
     schémas en cycle (A -> B -> A)          -> versionnés ensemble : si l'un change, tous changent
 
 Les références internes (#/components/schemas/Y), y compris dans discriminator.mapping,
@@ -39,6 +47,7 @@ Dépendances : PyYAML (pip install pyyaml) et openapi_common.py, à garder à c�
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -49,8 +58,9 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openapi_common import (  # noqa: E402
-    DESCRIPTIONS, LOCAL, SCHEMA_FILE_REF, SCHEMAS_DIR, SOURCE_FILE, breaking_changes, canon, to_sibling_refs, dump, load, map_refs, other_refs, rename_map, schema_naming, schema_refs,
-    shape, without_sources)
+    COMPONENTS_DIR, DESCRIPTIONS, LOCAL, SCHEMA_FILE_REF, SECTION_KIND, SECTION_TITLE, SECTIONS, SOURCE_FILE,
+    breaking_changes, canon, disk_name, dump, load, local_prefix, map_refs, other_refs, rename_map, schema_naming,
+    schema_refs, shape, to_sibling_refs, without_sources)
 
 
 # ================================================================ versions sur le disque
@@ -68,10 +78,10 @@ def file_name(name: str, version) -> str:
     return f"{name}_V{version}.yaml"
 
 
-def fragment(name: str) -> str:
-    """Le schéma est dans components.schemas.<Nom> de son fichier : une $ref doit y pointer,
+def fragment(name: str, section: str = "schemas") -> str:
+    """Le composant est dans components.<section>.<Nom> de son fichier : une $ref doit y pointer,
     sinon elle désigne tout le document (info compris)."""
-    return f"#/components/schemas/{name}"
+    return f"#/components/{section}/{name}"
 
 
 def schema_file(schemas_dir: Path, name: str, version: Version) -> Path:
@@ -92,7 +102,7 @@ def existing_versions(schemas_dir: Path, name: str) -> list[Version]:
 
 def dependency_majors(content, ignore: set[str]) -> set[tuple[str, str]]:
     """Dépendances d'un contenu avec leur majeure : {("Order", "1"), ...}, hors noms ignorés."""
-    found = re.findall(r"\.\./([^/\"]+)/\1_[vV](\d+)\.\d+\.yaml", canon(without_sources(content)))
+    found = re.findall(r"/([^/\"]+)/\1_[vV](\d+)\.\d+\.yaml", canon(without_sources(content)))
     return {(name, major) for name, major in found if name not in ignore}
 
 
@@ -172,27 +182,75 @@ def prepare_schemas(schemas: dict, where: str, resolve_external=None) -> tuple[d
     return renamed, origins
 
 
-def read_schemas(source: Path) -> tuple[dict, dict]:
-    """Schémas d'un fichier de schémas en bloc, contrôlés et renommés (voir prepare_schemas)."""
+def prepare_section(items: dict, section: str, where: str, done: dict[str, dict[str, tuple[str, Version]]],
+                    source_ref: str | None = None) -> tuple[dict, dict]:
+    """Parameters, responses, securitySchemes : noms inchangés ; les références vers une section déjà
+    découpée (done : {section: {nom d'origine: (nom sur disque, version)}}) deviennent
+    ../../<section>/<Nom>/<Nom>_V<x.y>.yaml#/components/<section>/<Nom>.
+    source_ref : chemin du fichier en bloc vu depuis un dossier de composant ; les références vers une section
+    non découpée (examples, headers…) y pointent, la section restant dans le fichier en bloc."""
+    names = set(items)
+    kept = re.compile(r"^#/components/(?!(?:" + "|".join(SECTIONS) + r")/)[A-Za-z]+/")
+    prepared = {}
+    for name, item in items.items():
+        for other, mapping in done.items():
+            def to_file(dep: str, other=other, mapping=mapping) -> str:
+                if dep not in mapping:
+                    raise ValueError(f"{where} : {section}.{name} référence {other}.{dep}, absent du fichier")
+                disk, version = mapping[dep]
+                return f"../../{other}/{disk}/{file_name(disk, version)}{fragment(disk, other)}"
+            item = map_refs(item, set(mapping), to_file, prefix=local_prefix(other))
+        if source_ref:
+            item = _keep_in_block(item, kept, source_ref)
+        prepared[name] = without_sources(item)
+    external = [ref for ref in other_refs(prepared, names, local_prefix(section))
+                if not SCHEMA_FILE_REF.search(ref) and not (source_ref and ref.startswith(source_ref + "#"))]
+    if external:
+        raise ValueError(f"{where} : {section} : {len(external)} référence(s) non prise(s) en charge (ex. {external[0]}) ; "
+                         f"sections découpées : {', '.join(SECTIONS)}.")
+    for name, item in prepared.items():
+        missing = sorted(schema_refs(item, names, local_prefix(section)) - names)
+        if missing:
+            raise ValueError(f"{where} : {section}.{name} référence un composant absent du fichier : {missing[0]}")
+    return prepared, {name: (name, SECTION_KIND[section]) for name in prepared}
+
+
+def _keep_in_block(node, kept: re.Pattern, source_ref: str):
+    """#/components/examples/X (section non découpée) -> <fichier en bloc>#/components/examples/X."""
+    if isinstance(node, list):
+        return [_keep_in_block(item, kept, source_ref) for item in node]
+    if not isinstance(node, dict):
+        return node
+    return {k: (source_ref + v if k == "$ref" and isinstance(v, str) and kept.match(v) else _keep_in_block(v, kept, source_ref))
+            for k, v in node.items()}
+
+
+def read_components(source: Path) -> dict:
+    """components d'un fichier de composants en bloc (sans paths)."""
     if not source.is_file():
-        raise ValueError(f"Fichier de schémas introuvable : {source.resolve()} "
+        raise ValueError(f"Fichier de composants introuvable : {source.resolve()} "
                          f"(lancez le script depuis la racine du projet, ou adaptez SOURCE_FILE dans openapi_common.py)")
     doc = load(source)
     if not isinstance(doc, dict):
         raise ValueError(f"{source} n'est pas un fichier YAML OpenAPI")
     if doc.get("paths") or doc.get("webhooks"):
-        raise ValueError(f"{source} contient des paths : ce script attend un fichier de schémas seulement "
-                         f"(openapi + info + components.schemas). Pour une API, utilisez extract_api_schemas.py.")
-    schemas = (doc.get("components") or {}).get("schemas")
-    if not schemas:
-        raise ValueError(f"{source} : aucun schéma dans components.schemas")
-    return prepare_schemas(schemas, str(source))
+        raise ValueError(f"{source} contient des paths : ce script attend un fichier de composants seulement "
+                         f"(openapi + info + components). Pour une API, utilisez extract_api_schemas.py.")
+    components = doc.get("components") or {}
+    if not any(components.get(section) for section in SECTIONS):
+        raise ValueError(f"{source} : aucun composant à découper ({', '.join(SECTIONS)})")
+    return components
 
 
 # ================================================================ décisions de version
 
 class Splitter:
-    """Décide la version de chaque schéma, sans rien écrire (les écritures sont dans self.writes)."""
+    """Décide la version de chaque schéma, sans rien écrire (les écritures sont dans self.writes).
+    Sert aussi aux autres sections (parameters, responses…) : section et external_bumped sont
+    fixés par split_schemas avant run()."""
+
+    section = "schemas"
+    external_bumped: frozenset = frozenset()  # composants d'autres sections passés en majeure dans ce lancement
 
     def __init__(self, schemas: dict, out: Path, forced_major: set[str]):
         self.schemas = schemas
@@ -231,7 +289,7 @@ class Splitter:
         disk = self.fn(name)
         if (disk, version) not in self._files:
             doc = load(schema_file(self.out, disk, version))
-            self._files[(disk, version)] = doc["components"]["schemas"][disk]
+            self._files[(disk, version)] = doc["components"][self.section][disk]
         return self._files[(disk, version)]
 
     def latest_in_major(self, name: str, major: int) -> Version:
@@ -239,7 +297,7 @@ class Splitter:
 
     # -- contenu tel qu'il serait écrit
     def deps(self, name: str) -> set[str]:
-        return schema_refs(self.schemas[name], self.names)
+        return schema_refs(self.schemas[name], self.names, local_prefix(self.section))
 
     def content(self, name: str, undecided: set[str] = frozenset()) -> dict:
         """Le schéma, ses références pointant vers les versions choisies.
@@ -247,8 +305,8 @@ class Splitter:
         def to_file(dep: str) -> str:
             version = "0.0" if dep in undecided else self.chosen[dep]
             disk = self.fn(dep)
-            return f"../{disk}/{file_name(disk, version)}{fragment(disk)}"
-        return without_sources(map_refs(self.schemas[name], self.names, to_file))
+            return f"../{disk}/{file_name(disk, version)}{fragment(disk, self.section)}"
+        return without_sources(map_refs(self.schemas[name], self.names, to_file, prefix=local_prefix(self.section)))
 
     # -- décision pour un groupe : un schéma seul, ou des schémas en cycle
     def decide(self, group: list[str]) -> None:
@@ -267,7 +325,8 @@ class Splitter:
 
         # 2. Sinon tous reçoivent une nouvelle version (dans un cycle, ils se référencent mutuellement).
         is_major = any(self.is_forced(name) for name in group) or any(
-            dep in self.major_bumped for name in group for dep in self.deps(name) - members)
+            dep in self.major_bumped for name in group for dep in self.deps(name) - members) or any(
+            dep in self.external_bumped for name in group for dep, _ in dependency_majors(draft[name], disk_names))
         existing = [name for name in group if self.versions(name)]
         previous = self.base_versions(existing, draft, disk_names, is_major)
         for name in group:
@@ -338,7 +397,9 @@ class Splitter:
         if self.is_forced(name):
             return "changement cassant (--major)"
         if shape(old) == shape(new):  # seules les versions des références ont changé
-            changed = sorted(self.fn(dep) for dep in (self.deps(name) - members) & self.renewed)
+            before, after = _ref_versions(old), _ref_versions(new)
+            changed = sorted(dep for dep, version in after.items()
+                             if before.get(dep) != version and dep not in {self.fn(m) for m in members})
             cause = f"cascade : {', '.join(changed)}" if changed else "cascade dans le cycle"
             return cause + (" (majeure)" if is_major else "")
         if is_major:
@@ -359,10 +420,18 @@ class Splitter:
             self.decide(group)
 
 
+def _ref_versions(content) -> dict[str, str]:
+    """{Nom: version} des fichiers découpés référencés par un contenu."""
+    return dict(re.findall(r"/([^/\"]+)/\1_[vV](\d+\.\d+)\.yaml", canon(without_sources(content))))
+
+
 # ================================================================ écriture et rapport
 
 BANNER = "#" * 62
-BANNER_TITLE = ("#" + "Schema file information".center(60)).rstrip()
+
+
+def banner_title(section: str) -> str:
+    return ("#" + f"{SECTION_TITLE[section]} file information".center(60)).rstrip()
 
 
 _SPLIT_FROM = re.compile(r"^# created on: \S+ split from (?P<source>.+)$", re.M)
@@ -378,35 +447,44 @@ def _origin_note(out: Path, splitter: "Splitter", name: str, source_name: str) -
     return f" (existant créé depuis {source})" if source and source != source_name else ""
 
 
-def render(name: str, version: Version, content: dict, source_name: str, origin: tuple[str, str]) -> str:
-    """Texte d'un fichier de schéma : en-tête, info, components.schemas.<Nom>."""
+def render(name: str, version: Version, content: dict, source_name: str, origin: tuple[str, str],
+           section: str = "schemas") -> str:
+    """Texte d'un fichier de composant : en-tête, info, components.<section>.<Nom>."""
     base, kind = origin
     header = (f"# created on: {date.today():%d/%m/%Y} split from {source_name}\n\n"
-              f"{BANNER}\n{BANNER_TITLE}\n{BANNER}\n\n")
+              f"{BANNER}\n{banner_title(section)}\n{BANNER}\n\n")
     info = (f"info:\n"
             f"    title: {name}\n"
             f"    description: >\n"
             f"        {DESCRIPTIONS[kind].format(base=base)}\n"
             f"    version: {version}.0\n\n\n")
-    body = dump({"components": {"schemas": {name: content}}}, indent=4)
+    body = dump({"components": {section: {name: content}}}, indent=4)
     body = re.sub(r"^(\s*(?:-\s+)?\$ref: )(\.\./\S+)$", r"\1'\2'", body, flags=re.M)  # $ref: '../X/X_V1.0.yaml#/…'
     return header + info + body
 
 
 def split_schemas(schemas: dict, origins: dict, out: Path, forced_major: set[str], dry_run: bool,
                   source_name: str, title: str, strict: bool = False,
-                  splitter_class: type = None) -> list[tuple[str, Version, str]]:
+                  splitter_class: type = None, section: str = "schemas", external_bumped: set = frozenset(),
+                  report: dict | None = None) -> list[tuple[str, Version, str]]:
     """Versionne et écrit des schémas déjà préparés (prepare_schemas) dans le dossier des schémas.
     Affiche le rapport sous le titre donné. Renvoie les fichiers créés : [(Nom, version, raison)].
     strict : une nouvelle version mineure qui semble cassante bloque tout (ValueError, rien n'est écrit) ;
-    utilisé par extract_api_schemas.py, qui synchronise aussitôt les API."""
-    forced = {schema_naming(name)[0] for name in forced_major}  # --major accepte l'ancien ou le nouveau nom
-    unknown = sorted(name for name in forced_major if schema_naming(name)[0] not in schemas)
+    utilisé par extract_api_schemas.py, qui synchronise aussitôt les API.
+    section : schemas, parameters, responses ou securitySchemes (out = components/<section>).
+    report : rempli avec {"chosen": {Nom: version}, "bumped": {Noms passés en majeure}}."""
+    forced = {disk_name(section, name) for name in forced_major}  # --major accepte l'ancien ou le nouveau nom
+    unknown = sorted(name for name in forced_major if disk_name(section, name) not in schemas)
     if unknown:
         raise ValueError(f"--major : schéma(s) absent(s) : {', '.join(unknown)}")
 
     splitter = (splitter_class or Splitter)(schemas, out, forced)
+    splitter.section = section
+    splitter.external_bumped = frozenset(external_bumped)
     splitter.run()
+    if report is not None:
+        report["chosen"] = {splitter.fn(name): version for name, version in splitter.chosen.items()}
+        report["bumped"] = {splitter.fn(name) for name in splitter.major_bumped}
     base_of = {splitter.fn(base): base for base in schemas}
 
     def origin_of(disk: str) -> tuple[str, str]:
@@ -446,7 +524,7 @@ def split_schemas(schemas: dict, origins: dict, out: Path, forced_major: set[str
         for name, version, content, _ in created:  # une version réutilisée n'est jamais réécrite
             path = schema_file(out, name, version)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(render(name, version, content, source_name, origin_of(name)), encoding="utf-8")
+            path.write_text(render(name, version, content, source_name, origin_of(name), section), encoding="utf-8")
 
     reused = [file_name(name, version)[:-5] for name, version, _, reason in splitter.writes if not reason]
     print(f"{'[simulation] ' if dry_run else ''}{title}")
@@ -463,20 +541,52 @@ def split_schemas(schemas: dict, origins: dict, out: Path, forced_major: set[str
 
 
 def split(source: Path, out: Path, forced_major: set[str], dry_run: bool) -> None:
-    schemas, origins = read_schemas(source)
-    created = split_schemas(schemas, origins, out, forced_major, dry_run, source.name, f"✔ {source} -> {out}/")
-    if any(not reason.startswith("nouveau") for *_, reason in created):
+    """Découpe chaque section de components dans out/<section>/ (schémas d'abord : les autres y font référence)."""
+    components = read_components(source)
+    present = [section for section in SECTIONS if components.get(section)]
+    known = {disk_name(section, name): section for section in present for name in components[section]}
+    known.update({name: section for section in present for name in components[section]})
+    unknown = sorted(name for name in forced_major if name not in known)
+    if unknown:
+        raise ValueError(f"--major : composant(s) absent(s) de {source.name} : {', '.join(unknown)}")
+    skipped = sorted(set(components) - set(SECTIONS))
+
+    done: dict[str, dict[str, tuple[str, Version]]] = {}
+    bumped: set[str] = set()
+    renewed = False
+    for section in present:
+        items = components[section]
+        if section == "schemas":
+            prepared, origins = prepare_schemas(items, str(source))
+            disk = rename_map(items)
+        else:
+            folder = (out / section / "X").resolve()  # dossier d'un composant : out/<section>/<Nom>/
+            source_ref = os.path.relpath(source.resolve(), folder).replace(os.sep, "/")
+            prepared, origins = prepare_section(items, section, str(source), done, source_ref)
+            disk = {name: name for name in items}
+        report: dict = {}
+        print() if done else None
+        created = split_schemas(prepared, origins, out / section, {n for n in forced_major if known[n] == section},
+                                dry_run, source.name, f"✔ {source} : {section} ({len(items)}) -> {out / section}/",
+                                section=section, external_bumped=bumped, report=report)
+        done[section] = {name: (disk[name], report["chosen"][disk[name]]) for name in items}
+        bumped |= report["bumped"]
+        renewed |= any(not reason.startswith("nouveau") for *_, reason in created)
+    if skipped:
+        print(f"  · section(s) non découpée(s), laissée(s) dans {source.name} (les références y pointent) : "
+              f"{', '.join(skipped)}")
+    if renewed:
         print("  → Lancez sync_schemas.py pour repointer les contrats vers ces nouvelles versions.")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Découpe un fichier de schémas OpenAPI en <dossier des schémas>/<Nom>/<Nom>_V<x.y>.yaml.")
+        description="Découpe un fichier de composants OpenAPI en <components>/<section>/<Nom>/<Nom>_V<x.y>.yaml.")
     parser.add_argument("source", type=Path, nargs="?", default=SOURCE_FILE,
-                        help=f"fichier de schémas en bloc (défaut : {SOURCE_FILE})")
-    parser.add_argument("out", type=Path, nargs="?", default=SCHEMAS_DIR,
-                        help=f"dossier des schémas, créé si besoin (défaut : {SCHEMAS_DIR})")
-    parser.add_argument("--major", default="", help="schémas ayant un changement cassant, séparés par des virgules")
+                        help=f"fichier de composants en bloc (défaut : {SOURCE_FILE})")
+    parser.add_argument("out", type=Path, nargs="?", default=COMPONENTS_DIR,
+                        help=f"dossier components, créé si besoin (défaut : {COMPONENTS_DIR})")
+    parser.add_argument("--major", default="", help="composants ayant un changement cassant, séparés par des virgules")
     parser.add_argument("--dry-run", action="store_true", help="affiche ce qui serait fait sans rien écrire")
     args = parser.parse_args()
     try:

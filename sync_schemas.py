@@ -22,9 +22,9 @@ Seules les versions pas encore décrites sont ajoutées ; le reste du fichier n'
 Un schéma qui n'a qu'une version n'a pas de changelog.
 
 Usage :
-    python3 sync_schemas.py [api.yaml ...] [--schemas-dir D] [--apis-dir D] [--dry-run | --check | --watch [S]]
+    python3 sync_schemas.py [api.yaml ...] [--components-dir D] [--apis-dir D] [--dry-run | --check | --watch [S]]
 
-    Sans argument : SCHEMAS_DIR et APIS_DIR de openapi_common.py (configuration du projet).
+    Sans argument : COMPONENTS_DIR et APIS_DIR de openapi_common.py (configuration du projet).
     api.yaml ...   API à traiter (défaut : la dernière version de chaque <dossier des API>/<api>/v<x>/<api>.yaml ;
                    les anciennes versions ne sont jamais modifiées)
     --dry-run      affiche les changements sans rien écrire
@@ -49,7 +49,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openapi_common import (  # noqa: E402
-    APIS_DIR, LOCAL, SCHEMAS_DIR, api_name, block_ref_schema, dump, load, loads, map_refs,
+    APIS_DIR, COMPONENTS_DIR, LOCAL, SECTIONS, api_name, block_ref, disk_name, dump, load, loads, map_refs,
     rename_map, renamed_for_api, schema_diff, to_sibling_refs, schema_naming, schema_refs, shape,
     yaml_error)
 
@@ -57,25 +57,23 @@ from openapi_common import (  # noqa: E402
 SCHEMA_FILE = re.compile(r"^(?P<name>.+)_(?P<v>[vV])(?P<major>\d+)\.(?P<minor>\d+)\.yaml$")
 # …/Nom/Nom_V1.2.yaml, quel que soit le nom du dossier des schémas
 VERSIONED_REF = re.compile(
-    r"(?<=/)(?P<name>[^/\s'\"#]+)/(?P=name)_(?P<v>[vV])(?P<major>\d+)\.(?P<minor>\d+)\.yaml")
+    r"(?<=/)(?:(?P<section>[^/\s'\"#]+)/)?(?P<name>[^/\s'\"#]+)/(?P=name)_(?P<v>[vV])(?P<major>\d+)\.(?P<minor>\d+)\.yaml")
 # Toute valeur qui est un chemin relatif vers un .yaml (+ fragment éventuel) : $ref et discriminator.mapping
 RELATIVE_PATH = re.compile(
-    r":\s*['\"]?(?P<ref>\.\.?/[^'\"\s#]+\.ya?ml)(?:#/components/schemas/(?P<schema>[^'\"\s]+))?")
+    r":\s*['\"]?(?P<ref>\.\.?/[^'\"\s#]+\.ya?ml)(?:#/components/(?P<section>[A-Za-z]+)/(?P<schema>[^'\"\s]+))?")
 
 
 # ================================================================ index des schémas
 
 class Catalog:
-    """Versions existantes dans le dossier des schémas : {Nom: {majeure: [mineures triées]}}."""
+    """Versions existantes d'une section (components/<section>) : {Nom: {majeure: [mineures triées]}}."""
 
-    def __init__(self, schemas_dir: Path):
-        self.dir = schemas_dir
-        if not self.dir.is_dir():
-            raise ValueError(f"Dossier des schémas introuvable : {self.dir.resolve()} "
-                             f"(lancez d'abord split_openapi.py, ou adaptez SCHEMAS_DIR dans openapi_common.py)")
+    def __init__(self, section_dir: Path, section: str = "schemas"):
+        self.dir = section_dir
+        self.section = section
         self.versions: dict[str, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
         self.letter: dict[str, str] = {}  # « V » (actuel) ou « v » (ancien format), par schéma
-        for folder in (d for d in self.dir.iterdir() if d.is_dir()):
+        for folder in (d for d in self.dir.iterdir() if d.is_dir()) if self.dir.is_dir() else ():
             for file in folder.iterdir():
                 m = SCHEMA_FILE.match(file.name)
                 if m and m["name"] == folder.name:
@@ -98,7 +96,7 @@ class Catalog:
 
     def fragment(self, name: str) -> str:
         """Format actuel : le schéma est dans components.schemas.<Nom>, la $ref doit y pointer."""
-        return f"#/components/schemas/{name}" if self.letter.get(name, "V") == "V" else ""
+        return f"#/components/{self.section}/{name}" if self.letter.get(name, "V") == "V" else ""
 
     def ref(self, name: str, major: int, minor: int) -> str:
         return self.file_name(name, major, minor) + self.fragment(name)
@@ -111,12 +109,16 @@ class Catalog:
         key = (name, major, minor)
         if key not in self._files:
             doc = load(self.path(name, major, minor))
-            schemas = (doc.get("components") or {}).get("schemas") or {} if isinstance(doc, dict) else {}
+            schemas = (doc.get("components") or {}).get(self.section) or {} if isinstance(doc, dict) else {}
             self._files[key] = schemas.get(name, doc)
         return self._files[key]
 
     def files(self) -> list[Path]:
-        return [f for d in self.dir.iterdir() if d.is_dir() for f in d.glob("*.yaml")]
+        return [f for d in self.dir.iterdir() if d.is_dir() for f in d.glob("*.yaml")] if self.dir.is_dir() else []
+
+    def label(self, name: str) -> str:
+        """Nom affiché : section/Nom, sauf pour les schémas."""
+        return name if self.section == "schemas" else f"{self.section}/{name}"
 
     def matching_major(self, name: str, inline: dict, names: set, renamed: dict[str, str]) -> int | None:
         """Majeure de la version existante identique au schéma défini dans une API
@@ -127,6 +129,14 @@ class Catalog:
             if shape(self.content(name, major, minor)) == target:
                 return major
         return None
+
+
+def load_catalogs(components_dir: Path) -> dict[str, Catalog]:
+    """Un Catalog par section de components/ (schemas obligatoire)."""
+    if not (components_dir / "schemas").is_dir():
+        raise ValueError(f"Dossier des schémas introuvable : {(components_dir / 'schemas').resolve()} "
+                         f"(lancez d'abord split_openapi.py, ou adaptez COMPONENTS_DIR dans openapi_common.py)")
+    return {section: Catalog(components_dir / section, section) for section in SECTIONS}
 
 
 # ================================================================ synchronisation d'une API
@@ -192,52 +202,53 @@ def externalize(doc: dict, catalog: Catalog, prefix: str, label: str) -> tuple[d
     return new_doc, changes, []
 
 
-def resolve_block_refs(doc: dict, catalog: Catalog, prefix: str) -> tuple[dict, list[str]]:
-    """Étape 0 : $ref vers le fichier commun en bloc (…/rdv-actor-schemas.yaml#/components/schemas/S_X)
-    -> fichier découpé correspondant (XObject/XObject_V<dernière>.yaml). Une cible inconnue reste telle quelle."""
+def resolve_block_refs(doc: dict, catalogs: dict[str, Catalog], api_dir: Path) -> tuple[dict, list[str]]:
+    """Étape 0 : $ref vers le fichier commun en bloc (…/rdv-actor-schemas.yaml#/components/<section>/X)
+    -> fichier découpé correspondant (components/<section>/X/X_V<dernière>.yaml). Une cible inconnue reste telle quelle."""
     changes = []
 
-    def to_ref(original: str) -> str:
-        name = schema_naming(original)[0]
-        versions = catalog.all(name)
-        if not versions:
-            raise LookupError(original)
-        major, minor = versions[-1]
-        changes.append(f"{original} (fichier commun) -> {name} v{major}.{minor}")
-        return f"{prefix}/{name}/{catalog.ref(name, major, minor)}"
-
-    def safe(original: str, value: str) -> str:
+    def convert(value: str) -> str:
+        section, original = block_ref(value)
+        catalog = catalogs.get(section)
         try:
-            return to_ref(original)
-        except (LookupError, ValueError):
+            name = disk_name(section, original)
+        except ValueError:
             return value
+        if catalog is None or not catalog.all(name):
+            return value
+        major, minor = catalog.all(name)[-1]
+        changes.append(f"{original} (fichier commun) -> {catalog.label(name)} v{major}.{minor}")
+        prefix = os.path.relpath(catalog.dir, api_dir).replace(os.sep, "/")
+        return f"{prefix}/{name}/{catalog.ref(name, major, minor)}"
 
     def walk(node):
         if isinstance(node, list):
             return [walk(item) for item in node]
         if not isinstance(node, dict):
             return node
-        return {k: (safe(name, v) if k == "$ref" and (name := block_ref_schema(v)) else walk(v)) for k, v in node.items()}
+        return {k: (convert(v) if k == "$ref" and block_ref(v) else walk(v)) for k, v in node.items()}
 
     return walk(doc), sorted(set(changes))
 
 
-def upgrade_versions(text: str, catalog: Catalog) -> tuple[str, list[str]]:
-    """Étape 2 : chaque schemas/X/X_va.b.yaml -> dernière version a.y existante."""
+def upgrade_versions(text: str, catalogs: dict[str, Catalog]) -> tuple[str, list[str]]:
+    """Étape 2 : chaque <section>/X/X_va.b.yaml -> dernière version a.y existante."""
     changes = []
 
     def upgrade(m: re.Match) -> str:
         name, major, minor = m["name"], int(m["major"]), int(m["minor"])
+        catalog = catalogs.get(m["section"]) or catalogs["schemas"]
         newest = catalog.latest(name, major)
         if newest is None or newest <= minor:
             return m[0]
-        changes.append(f"{name} : v{major}.{minor} -> v{major}.{newest}")
-        return f"{name}/{name}_{m['v']}{major}.{newest}.yaml"
+        changes.append(f"{catalog.label(name)} : v{major}.{minor} -> v{major}.{newest}")
+        section = f"{m['section']}/" if m["section"] else ""
+        return f"{section}{name}/{name}_{m['v']}{major}.{newest}.yaml"
 
     return VERSIONED_REF.sub(upgrade, text), changes
 
 
-def sync_api(api_file: Path, catalog: Catalog, write: bool, root: Path) -> tuple[list[str], list[str]]:
+def sync_api(api_file: Path, catalogs: dict[str, Catalog], write: bool, root: Path) -> tuple[list[str], list[str]]:
     """Synchronise une API. Renvoie (changements, erreurs) ; rien n'est écrit en cas d'erreur."""
     label = display(api_file, root)
     text = api_file.read_text(encoding="utf-8")
@@ -247,9 +258,10 @@ def sync_api(api_file: Path, catalog: Catalog, write: bool, root: Path) -> tuple
         doc = loads(text) if LOCAL in text or "components" in text else None
     except yaml.YAMLError as error:  # une API invalide est signalée, les autres sont quand même traitées
         return [], [str(yaml_error(label, error))]
+    catalog = catalogs["schemas"]
     prefix = os.path.relpath(catalog.dir, api_file.parent).replace(os.sep, "/")
-    if doc is not None and ".yaml#/components/schemas/" in text:
-        doc, changes = resolve_block_refs(doc, catalog, prefix)
+    if doc is not None and ".yaml#/components/" in text:
+        doc, changes = resolve_block_refs(doc, catalogs, api_file.parent)
     has_inline = bool(((doc or {}).get("components") or {}).get("schemas"))
     if doc is not None and (has_inline or LOCAL in text):
         new_doc, changed, errors = externalize(doc, catalog, prefix, label)
@@ -260,7 +272,7 @@ def sync_api(api_file: Path, catalog: Catalog, write: bool, root: Path) -> tuple
     if changes:
         text = dump(doc)
 
-    text, upgraded = upgrade_versions(text, catalog)
+    text, upgraded = upgrade_versions(text, catalogs)
     changes += upgraded
     if write and changes:
         api_file.write_text(text, encoding="utf-8")
@@ -341,13 +353,13 @@ def update_changelog(catalog: Catalog, name: str, write: bool) -> list[str]:
 
 # ================================================================ découverte et contrôles
 
-def discover_apis(apis_dir: Path, schemas_dir: Path) -> tuple[list[Path], list[Path]]:
+def discover_apis(apis_dir: Path, components_dir: Path) -> tuple[list[Path], list[Path]]:
     """API de <dossier des API>/<api>/v<x>/<api>.yaml : (dernière version de chaque API, anciennes versions).
     Seule la dernière version est traitée : les anciennes restent figées."""
     if not apis_dir.is_dir():
         raise ValueError(f"Dossier des API introuvable : {apis_dir.resolve()} (adaptez APIS_DIR dans openapi_common.py)")
     latest, older = [], []
-    for api in sorted(p for p in apis_dir.iterdir() if p.is_dir() and p.resolve() != schemas_dir.resolve()):
+    for api in sorted(p for p in apis_dir.iterdir() if p.is_dir() and p.resolve() != components_dir.resolve()):
         versions = sorted((int(d.name[1:]), d / f"{api.name}.yaml") for d in api.iterdir()
                           if d.is_dir() and re.fullmatch(r"v\d+", d.name) and (d / f"{api.name}.yaml").exists())
         if versions:
@@ -360,7 +372,7 @@ def broken_refs(files: list[Path], root: Path) -> list[str]:
     """Références relatives ($ref, discriminator.mapping) vers un fichier absent, ou vers un
     schéma absent de components.schemas du fichier visé."""
     errors = []
-    schemas_in: dict[Path, set] = {}
+    schemas_in: dict[tuple[Path, str], set] = {}
     for file in files:
         for m in RELATIVE_PATH.finditer(file.read_text(encoding="utf-8")):
             target = (file.parent / m["ref"]).resolve()
@@ -368,33 +380,34 @@ def broken_refs(files: list[Path], root: Path) -> list[str]:
                 errors.append(f"{display(file, root)} : $ref introuvable -> {m['ref']}")
                 continue
             if m["schema"]:
-                if target not in schemas_in:
+                key = (target, m["section"])
+                if key not in schemas_in:
                     try:
                         doc = load(target)
                     except ValueError as error:
                         errors.append(str(error))
-                        schemas_in[target] = None
+                        schemas_in[key] = None
                         continue
-                    schemas_in[target] = set(((doc or {}).get("components") or {}).get("schemas") or {})
-                if schemas_in[target] is None:
+                    schemas_in[key] = set(((doc or {}).get("components") or {}).get(m["section"]) or {})
+                if schemas_in[key] is None:
                     continue
-                if m["schema"] not in schemas_in[target]:
-                    errors.append(f"{display(file, root)} : schéma {m['schema']} absent de {m['ref']}")
+                if m["schema"] not in schemas_in[key]:
+                    errors.append(f"{display(file, root)} : {m['section']}.{m['schema']} absent de {m['ref']}")
     return list(dict.fromkeys(errors))
 
 
-def run(schemas_dir: Path, apis_dir: Path, apis: list[Path], mode: str) -> int:
+def run(components_dir: Path, apis_dir: Path, apis: list[Path], mode: str) -> int:
     """mode : write | dry-run | check. Renvoie le code de sortie.
     Sans API donnée : dernière version de chaque API de apis_dir."""
-    catalog = Catalog(schemas_dir)
-    targets, older = (apis, []) if apis else discover_apis(apis_dir, schemas_dir)
+    catalogs = load_catalogs(components_dir)
+    targets, older = (apis, []) if apis else discover_apis(apis_dir, components_dir)
     root = apis_dir
     tag = {"dry-run": "[simulation] ", "check": "[contrôle] "}.get(mode, "")
 
     # Une ligne par API : à jour, mise à jour, ou erreur.
     results = []
     for api in targets:
-        api_changes, api_errors = sync_api(api, catalog, mode == "write", root)
+        api_changes, api_errors = sync_api(api, catalogs, mode == "write", root)
         results.append((display(api, root), api_changes, api_errors))
     updated = sum(1 for _, changes, errors in results if changes and not errors)
     failed = sum(1 for _, _, errors in results if errors)
@@ -417,12 +430,13 @@ def run(schemas_dir: Path, apis_dir: Path, apis: list[Path], mode: str) -> int:
 
     errors = []
     if mode in ("write", "check"):
-        errors = broken_refs(targets + catalog.files(), root)
+        errors = broken_refs(targets + [f for c in catalogs.values() for f in c.files()], root)
         if errors:
             print(f"{tag}✖ Références cassées :")
             for error in errors:
                 print(f"  ✖ {error}")
-    changelogs = {name: added for name in sorted(catalog.versions)
+    changelogs = {catalog.label(name): added for catalog in catalogs.values()
+                  for name in sorted(catalog.versions)
                   if (added := update_changelog(catalog, name, write=mode == "write"))}
     if changelogs:
         print(f"{tag}{'Changelog à compléter' if mode == 'check' else 'Changelog mis à jour'} :")
@@ -441,20 +455,20 @@ def snapshot(*folders: Path) -> dict[str, float]:
     return {str(p): p.stat().st_mtime for folder in folders for p in folder.rglob("*.yaml")}
 
 
-def watch(schemas_dir: Path, apis_dir: Path, apis: list[Path], interval: float) -> None:
-    print(f"Surveillance de {schemas_dir} et {apis_dir} (Ctrl+C pour arrêter)…")
-    run(schemas_dir, apis_dir, apis, "write")
-    before = snapshot(schemas_dir, apis_dir)
+def watch(components_dir: Path, apis_dir: Path, apis: list[Path], interval: float) -> None:
+    print(f"Surveillance de {components_dir} et {apis_dir} (Ctrl+C pour arrêter)…")
+    run(components_dir, apis_dir, apis, "write")
+    before = snapshot(components_dir, apis_dir)
     try:
         while True:
             time.sleep(interval)
-            if snapshot(schemas_dir, apis_dir) != before:
+            if snapshot(components_dir, apis_dir) != before:
                 print(f"\n[{time.strftime('%H:%M:%S')}] modification détectée")
                 try:
-                    run(schemas_dir, apis_dir, apis, "write")
+                    run(components_dir, apis_dir, apis, "write")
                 except (ValueError, OSError, yaml.YAMLError) as error:
                     print(f"✖ {error}", file=sys.stderr)
-                before = snapshot(schemas_dir, apis_dir)  # inclut nos propres écritures
+                before = snapshot(components_dir, apis_dir)  # inclut nos propres écritures
     except KeyboardInterrupt:
         print("\nArrêt.")
 
@@ -463,7 +477,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Synchronise les $ref des API avec les schémas versionnés.")
     parser.add_argument("apis", type=Path, nargs="*",
                         help="API à traiter (défaut : toutes les <dossier des API>/<api>/v<x>/<api>.yaml)")
-    parser.add_argument("--schemas-dir", type=Path, default=SCHEMAS_DIR, help=f"défaut : {SCHEMAS_DIR}")
+    parser.add_argument("--components-dir", type=Path, default=COMPONENTS_DIR, help=f"défaut : {COMPONENTS_DIR}")
     parser.add_argument("--apis-dir", type=Path, default=APIS_DIR, help=f"défaut : {APIS_DIR}")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="affiche sans écrire")
@@ -473,10 +487,10 @@ def main() -> None:
     args = parser.parse_args()
     try:
         if args.watch is not None:
-            watch(args.schemas_dir, args.apis_dir, args.apis, args.watch)
+            watch(args.components_dir, args.apis_dir, args.apis, args.watch)
         else:
             mode = "dry-run" if args.dry_run else "check" if args.check else "write"
-            sys.exit(run(args.schemas_dir, args.apis_dir, args.apis, mode))
+            sys.exit(run(args.components_dir, args.apis_dir, args.apis, mode))
     except (ValueError, OSError, yaml.YAMLError) as error:
         print(f"✖ {error}", file=sys.stderr)
         sys.exit(1)
