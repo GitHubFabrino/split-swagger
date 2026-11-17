@@ -30,6 +30,7 @@ import yaml
 SOURCE_FILE = Path("swaggers/RDV/schemas/rdv-actor-schemas.yaml")  # fichier de composants en bloc à découper
 SCHEMAS_DIR = Path("swaggers/RDV/schemas")                          # sortie : un dossier par composant
 APIS_DIR = Path("swaggers/RDV")                                     # API : <api>/v<x>/<api>.yaml
+BLOCK_API = "rdv-actor"     # API dont info.version suit celle du fichier en bloc à chaque split (dernière version)
 
 SECTIONS = ("schemas", "parameters", "responses", "securitySchemes")
 
@@ -361,3 +362,30 @@ def existing_versions(out: Path, name: str) -> list[tuple[int, int]]:
 def relpath(target: Path, start: Path) -> str:
     """Chemin relatif avec des / (aussi sous Windows)."""
     return os.path.relpath(target.resolve(), start.resolve()).replace(os.sep, "/")
+
+
+# ================================================================ info.version
+
+_INFO_VERSION = re.compile(r"(?m)^(info:[ \t]*\n(?:[ \t]+.*\n|[ \t]*\n)*?[ \t]+version:[ \t]*)(['\"]?)(?P<v>[^'\"\n#]+?)\2[ \t]*$")
+_INFO_VERSION_FLOW = re.compile(r"(?m)^info:[ \t]*\{[^}]*?\bversion:[ \t]*(['\"]?)(?P<v>[^,'\"}\s]+)\1")
+
+
+def info_version(text: str) -> tuple[str | None, re.Match | None]:
+    """(info.version, emplacement dans le texte) ; info sur plusieurs lignes ou sur une seule (info: {…})."""
+    m = _INFO_VERSION.search(text) or _INFO_VERSION_FLOW.search(text)
+    return (m["v"].strip(), m) if m else (None, None)
+
+
+def with_info_version(text: str, version: str) -> str:
+    """Texte avec info.version remplacée (tel quel si info.version est absente)."""
+    _, m = info_version(text)
+    if not m:
+        return text
+    value = f"'{version}'" if re.fullmatch(r"\d+(\.\d+)?", version) and not m[2 if m.re is _INFO_VERSION else 1] \
+        else version                                                   # 1.15 resterait sinon un nombre
+    return text[:m.start("v")] + value + text[m.end("v"):]
+
+
+def version_tuple(version: str | None) -> tuple[int, int, int]:
+    parts = [int(p) if p.isdigit() else 0 for p in (str(version or "0").split(".") + ["0", "0"])[:3]]
+    return parts[0], parts[1], parts[2]

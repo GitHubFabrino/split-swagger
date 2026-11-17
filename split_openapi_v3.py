@@ -9,6 +9,10 @@ Versions : identique -> réutilisé ; modifié -> mineure (1.3 -> 1.4) ; cassant
 par un message, sans confirmation. Les composants qui utilisent un composant modifié ne changent pas de version :
 sync_schemas_v3.py met ensuite leurs refs à jour (dernière version), ainsi que celles des API.
 Les autres sections du fichier en bloc (examples, headers…) y restent ; les références y pointent.
+Chaque fichier créé reçoit dans info.version la version du fichier en bloc (ex. 1.15.0) ; le nom du fichier
+garde la version du composant (ErrorOutput_V1.1.yaml). Un schéma au contenu identique garde son fichier : seule
+sa version passe à celle du bloc, avec une ligne « # updated on: <date> RDV 1.15.0 evolution (no content change) ».
+L'API BLOCK_API (rdv-actor, dernière version) prend aussi la version du bloc, si elle est plus grande.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openapi_common_v3 import (  # noqa: E402
-    LOCAL, SCHEMAS_DIR, SECTIONS, SOURCE_FILE, SPLIT_REF, all_refs, api_name, breaking_changes, dump,
+    APIS_DIR, BLOCK_API, LOCAL, SCHEMAS_DIR, SECTIONS, SOURCE_FILE, info_version, version_tuple, with_info_version, SPLIT_REF, all_refs, api_name, breaking_changes, dump,
     existing_versions, file_name, file_ref, load, map_refs, naming, ref_versions, relpath, renamed_for_api,
     schema_diff, schema_naming, shape, to_sibling_refs)
 
@@ -142,12 +146,15 @@ class Versioner:
     api (extraction) : un composant dont le nom existe déjà, créé depuis une autre source, est comparé
     détail par détail : identique -> réutilisé ; différent -> renommé avec le nom de l'API."""
 
-    def __init__(self, items: dict[str, Item], out: Path, source: str, api: str | None = None):
+    def __init__(self, items: dict[str, Item], out: Path, source: str, api: str | None = None,
+                 info_version: str | None = None):
         self.items, self.out, self.source, self.api = items, out, source, api
+        self.info_version = info_version          # info.version du fichier source (sinon x.y.0 du composant)
         self.final: dict[str, str] = {}               # renommage avec le nom de l'API
         self.chosen: dict[str, tuple[int, int]] = {}
         self.writes: list[tuple[str, tuple, dict, str | None]] = []
         self.refreshed: list[tuple[str, tuple, dict, dict]] = []  # refs mises à jour sur place
+        self.retagged: list[tuple[str, tuple, str | None]] = []   # contenu identique, info.version mise à jour
         self.notes: list[str] = []
         self.warnings: list[str] = []
         self._cache: dict = {}
@@ -234,6 +241,12 @@ class Versioner:
                 moved = {d: v for d, v in new.items() if old.get(d) != v}
                 self.refreshed.append((self.fn(n), latest[n], moved, old))
                 self.writes.append((self.fn(n), latest[n], self.content(n), None))
+                # Fichier venant de la même source, créé avec une autre version de cette source : on garde le
+                # fichier (contenu identique) et on met seulement sa version à jour (« # updated on … »).
+                path = self.out / self.fn(n) / file_name(self.fn(n), latest[n])
+                current, _ = info_version(path.read_text(encoding="utf-8"))
+                if self.info_version and current != self.info_version and self.source_of(n) == self.source:
+                    self.retagged.append((self.fn(n), latest[n], current))
             return
 
         # 2. Nouvelle version pour tout le groupe : majeure si le changement est cassant (le numéro le signale ;
@@ -279,6 +292,13 @@ class Versioner:
         for group in dependency_groups({name: self.deps(name) for name in self.items}):
             self.decide(group)
         names = {self.fn(n): n for n in self.items}
+        for disk, version, _ in self.retagged:        # contenu identique : version et date de mise à jour seulement
+            path = self.out / disk / file_name(disk, version)
+            lines = with_info_version(path.read_text(encoding="utf-8"), self.info_version).split("\n")
+            last = max(i for i, line in enumerate(lines[:10]) if line.startswith(("# created on:", "# updated on:")))
+            lines.insert(last + 1, f"# updated on: {date.today():%d/%m/%Y} RDV {self.info_version} evolution "
+                                   f"(no content change)")
+            path.write_text("\n".join(lines), encoding="utf-8")
         for disk, version, content, reason in self.writes:
             if reason:                                 # une version réutilisée n'est jamais réécrite
                 path = self.out / disk / file_name(disk, version)
@@ -289,7 +309,15 @@ class Versioner:
         for disk, version, _, reason in self.writes:
             if reason:
                 print(f"  + {disk}/{file_name(disk, version)}  ({reason})")
-        reused = [file_name(disk, version)[:-5] for disk, version, _, reason in self.writes if not reason]
+        retagged = {disk for disk, _, _ in self.retagged}
+        if self.retagged:
+            olds = sorted({old or "?" for _, _, old in self.retagged})
+            print(f"  ⟳ {len(self.retagged)} schéma(s) au contenu identique : info.version {', '.join(olds)} -> "
+                  f"{self.info_version} (« # updated on » ajouté) : "
+                  + ", ".join(file_name(d, v)[:-5] for d, v, _ in self.retagged[:12])
+                  + (f", … (+{len(self.retagged) - 12})" if len(self.retagged) > 12 else ""))
+        reused = [file_name(disk, version)[:-5] for disk, version, _, reason in self.writes
+                  if not reason and disk not in retagged]
         if reused:
             print(f"  = réutilisés ({len(reused)}) : " + ", ".join(reused[:30])
                   + (f", … (+{len(reused) - 30})" if len(reused) > 30 else ""))
@@ -311,15 +339,41 @@ class Versioner:
         body = re.sub(r"^(\s*(?:-\s+)?\$ref: )(\.\./\S+)$", r"\1'\2'", body, flags=re.M)
         return (f"# created on: {date.today():%d/%m/%Y} split from {self.source}\n\n{banner}\n{title}\n{banner}\n\n"
                 f"info:\n    title: {disk}\n    description: >\n        {DESCRIPTIONS[item.kind].format(base=item.base)}\n"
-                f"    version: {version[0]}.{version[1]}.0\n\n\n{body}")
+                f"    version: {self.version_text(version)}\n\n\n{body}")
+
+    def version_text(self, version) -> str:
+        """info.version écrit dans un fichier créé : celle du fichier source (ex. 1.14.0), sinon x.y.0."""
+        text = self.info_version or f"{version[0]}.{version[1]}.0"
+        return f"'{text}'" if re.fullmatch(r"\d+(\.\d+)?", text) else text  # 1.14 resterait sinon un nombre
 
 
 def split_components(components: dict, out: Path, source: str, source_ref: str | None = None,
-                     api: str | None = None) -> dict[str, dict[str, tuple[str, tuple[int, int]]]]:
+                     api: str | None = None, info_version: str | None = None) -> dict[str, dict[str, tuple[str, tuple[int, int]]]]:
     """Prépare, versionne et écrit des composants. Renvoie {section: {nom d'origine: (nom final, version)}}."""
     items, names = prepare(components, source, source_ref)
-    result = Versioner(items, out, source, api).run()
+    result = Versioner(items, out, source, api, info_version).run()
     return {section: {original: result[new] for original, new in mapping.items()} for section, mapping in names.items()}
+
+
+def follow_block_version(version: str) -> None:
+    """La dernière version de l'API BLOCK_API prend la version du fichier en bloc, si elle est plus grande
+    (jamais en arrière : après un sync, rdv-actor peut déjà être en 1.14.1 alors que le bloc est en 1.14.0)."""
+    folders = sorted((int(d.name[1:]), d / f"{BLOCK_API}.yaml") for d in (APIS_DIR / BLOCK_API).glob("v*")
+                     if d.name[1:].isdigit() and (d / f"{BLOCK_API}.yaml").is_file())
+    if not folders:
+        print(f"  · API {BLOCK_API} introuvable dans {APIS_DIR} : sa version n'est pas mise à jour (BLOCK_API)")
+        return
+    api = folders[-1][1]
+    text = api.read_text(encoding="utf-8")
+    current, _ = info_version(text)
+    label = f"{BLOCK_API}/v{folders[-1][0]}/{api.name}"
+    if current is None:
+        print(f"  ⚠ {label} : info.version introuvable, à mettre à {version} à la main")
+    elif version_tuple(version) > version_tuple(current):
+        api.write_text(with_info_version(text, version), encoding="utf-8")
+        print(f"  ↑ {label} : info.version {current} -> {version} (version de {SOURCE_FILE.name})")
+    else:
+        print(f"  · {label} : info.version {current} gardée ({SOURCE_FILE.name} est en {version})")
 
 
 def main() -> None:
@@ -334,7 +388,11 @@ def main() -> None:
             raise ValueError(f"{SOURCE_FILE} : aucun composant à découper ({', '.join(SECTIONS)})")
         print(f"✔ {SOURCE_FILE} -> {SCHEMAS_DIR}/")
         source_ref = relpath(SOURCE_FILE, SCHEMAS_DIR / "X")  # vu depuis un dossier de composant
-        split_components(components, SCHEMAS_DIR, SOURCE_FILE.name, source_ref)
+        version = (doc.get("info") or {}).get("version")
+        version = str(version).strip() if version not in (None, "") else None
+        split_components(components, SCHEMAS_DIR, SOURCE_FILE.name, source_ref, info_version=version)
+        if version:
+            follow_block_version(version)
         others = sorted(set(components) - set(SECTIONS))
         if others:
             print(f"  · non découpé, laissé dans {SOURCE_FILE.name} : {', '.join(others)}")

@@ -11,7 +11,8 @@ quel que soit son numéro, si elle est plus récente ; sinon rien ne change.
      tous avec --all, ceux qu'utilise l'API sinon ;
   2. API : refs vers le fichier en bloc converties, refs mises à jour, et info.version (1.X.Y) montée si un
      composant utilisé a changé, directement ou à travers un autre : changement cassant (nouvelle majeure
-     d'un composant) -> X+1, sinon Y+1 ;
+     d'un composant) -> X+1, sinon Y+1. Exception pour BLOCK_API (rdv-actor) : un changement dont le fichier
+     de schéma porte déjà la version de l'API (livraison du fichier en bloc) ne la fait pas monter ;
 puis contrôle des références cassées et CHANGELOG.md. Les schémas définis dans une API ne sont jamais touchés ;
 une ancienne version d'API n'est jamais modifiée.
 """
@@ -25,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openapi_common_v3 import (  # noqa: E402
-    APIS_DIR, BLOCK_REF, SCHEMAS_DIR, SECTIONS, SPLIT_REF, dump, existing_versions, file_name, file_ref, load, map_refs, naming, relpath, schema_diff)
+    BLOCK_API, info_version, version_tuple, with_info_version, APIS_DIR, BLOCK_REF, SCHEMAS_DIR, SECTIONS, SPLIT_REF, dump, existing_versions, file_name, file_ref, load, map_refs, naming, relpath, schema_diff)
 
 # ================================================================ catalogue (synchronisation)
 
@@ -213,23 +214,20 @@ def refresh_components(catalog: Catalog, only: set[str] | None = None) -> dict[s
     return refreshed
 
 
-INFO_VERSION_FLOW = re.compile(r"(?m)^info:[ \t]*\{[^}]*?\bversion:[ \t]*(['\"]?)(?P<v>[^,'\"}\s]+)\1")
-INFO_VERSION = re.compile(r"(?m)^(info:[ \t]*\n(?:[ \t]+.*\n|[ \t]*\n)*?[ \t]+version:[ \t]*)(['\"]?)([^'\"\n#]+?)\2[ \t]*$")
+def file_version(catalog: Catalog, name: str, version) -> str | None:
+    """info.version écrite dans un fichier de composant (version de la source qui l'a créé)."""
+    value = (catalog.doc(name, version).get("info") or {}).get("version")
+    return str(value).strip() if value not in (None, "") else None
 
 
 def bump_version(text: str, breaking: bool) -> tuple[str, str | None]:
     """info.version au format 1.X.Y : changement cassant -> X+1 et Y=0 ; sinon Y+1. Renvoie (texte, « a -> b »)."""
-    m = INFO_VERSION.search(text)
-    group = 3
-    if not m:
-        m, group = INFO_VERSION_FLOW.search(text), "v"     # info: {title: …, version: 1.0.0}
-    if not m:
+    old, _ = info_version(text)
+    if old is None:
         return text, None
-    old = m[group].strip()
-    parts = [int(p) if p.isdigit() else 0 for p in (old.split(".") + ["0", "0"])[:3]]
-    new = [parts[0], parts[1] + 1, 0] if breaking else [parts[0], parts[1], parts[2] + 1]
-    version = ".".join(map(str, new))
-    return text[:m.start(group)] + version + text[m.end(group):], f"{old} -> {version}"
+    major, minor, patch = version_tuple(old)
+    version = f"{major}.{minor + 1}.0" if breaking else f"{major}.{minor}.{patch + 1}"
+    return with_info_version(text, version), f"{old} -> {version}"
 
 
 def sync_api(api: Path, catalog: Catalog, refreshed: dict[str, list[Move]],
@@ -252,6 +250,16 @@ def sync_api(api: Path, catalog: Catalog, refreshed: dict[str, list[Move]],
     indirect = {name: refreshed[name] for name in sorted(used_before - ignore) if name in refreshed}
     lines = converted + text_moves(moves) + [f"via {name} : {', '.join(text_moves(m))}" for name, m in indirect.items()]
     all_moves = moves + [move for m in indirect.values() for move in m]
+    if all_moves and api.parent.parent.name == BLOCK_API:
+        # rdv-actor suit les livraisons du fichier en bloc : un changement dont le fichier de schéma porte déjà
+        # la version de l'API (ex. ActorNaturalObject_V1.1 en 1.15.0, API en 1.15.0) fait partie de cette
+        # livraison -> pas de montée de version pour lui.
+        current, _ = info_version(text)
+        delivered = [move for move in all_moves if file_version(catalog, move[0], move[2]) == current]
+        if delivered:
+            all_moves = [move for move in all_moves if move not in delivered]
+            lines.append(f"livraison {current} : {', '.join(dict.fromkeys(n for n, *_ in delivered))} "
+                         f"déjà inclus, version {current} gardée pour eux")
     if all_moves:
         breaking = any(new[0] > old[0] for _, old, new in all_moves)
         text, bumped = bump_version(text, breaking)

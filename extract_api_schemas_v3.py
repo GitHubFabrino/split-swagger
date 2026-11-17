@@ -100,7 +100,9 @@ def extract(api: Path) -> tuple[set[str], set[str]]:
         print("  ✔ aucun composant défini dans l'API (déjà extrait)")
     else:
         print(f"  → à extraire : {', '.join(f'{s} {len(i)}' for s, i in present.items())}")
-        result = split_components(present, SCHEMAS_DIR, label, relpath(api, SCHEMAS_DIR / "X"), api_name(label))
+        version = (doc.get("info") or {}).get("version")      # les fichiers extraits prennent la version de l'API
+        result = split_components(present, SCHEMAS_DIR, label, relpath(api, SCHEMAS_DIR / "X"), api_name(label),
+                                  str(version).strip() if version not in (None, "") else None)
         extracted = {final for mapping in result.values() for final, _ in mapping.values()}
 
         # Retrait des composants extraits ; chaque usage pointe vers son fichier.
