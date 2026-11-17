@@ -202,7 +202,8 @@ def externalize(doc: dict, catalog: Catalog, prefix: str, label: str) -> tuple[d
     return new_doc, changes, []
 
 
-def resolve_block_refs(doc: dict, catalogs: dict[str, Catalog], api_dir: Path) -> tuple[dict, list[str]]:
+def resolve_block_refs(doc: dict, catalogs: dict[str, Catalog], api_dir: Path,
+                       naming=disk_name) -> tuple[dict, list[str]]:
     """Étape 0 : $ref vers le fichier commun en bloc (…/rdv-actor-schemas.yaml#/components/<section>/X)
     -> fichier découpé correspondant (components/<section>/X/X_V<dernière>.yaml). Une cible inconnue reste telle quelle."""
     changes = []
@@ -211,7 +212,7 @@ def resolve_block_refs(doc: dict, catalogs: dict[str, Catalog], api_dir: Path) -
         section, original = block_ref(value)
         catalog = catalogs.get(section)
         try:
-            name = disk_name(section, original)
+            name = naming(section, original)
         except ValueError:
             return value
         if catalog is None or not catalog.all(name):
@@ -248,7 +249,8 @@ def upgrade_versions(text: str, catalogs: dict[str, Catalog]) -> tuple[str, list
     return VERSIONED_REF.sub(upgrade, text), changes
 
 
-def sync_api(api_file: Path, catalogs: dict[str, Catalog], write: bool, root: Path) -> tuple[list[str], list[str]]:
+def sync_api(api_file: Path, catalogs: dict[str, Catalog], write: bool, root: Path,
+             naming=disk_name) -> tuple[list[str], list[str]]:
     """Synchronise une API. Renvoie (changements, erreurs) ; rien n'est écrit en cas d'erreur."""
     label = display(api_file, root)
     text = api_file.read_text(encoding="utf-8")
@@ -261,7 +263,7 @@ def sync_api(api_file: Path, catalogs: dict[str, Catalog], write: bool, root: Pa
     catalog = catalogs["schemas"]
     prefix = os.path.relpath(catalog.dir, api_file.parent).replace(os.sep, "/")
     if doc is not None and ".yaml#/components/" in text:
-        doc, changes = resolve_block_refs(doc, catalogs, api_file.parent)
+        doc, changes = resolve_block_refs(doc, catalogs, api_file.parent, naming)
     has_inline = bool(((doc or {}).get("components") or {}).get("schemas"))
     if doc is not None and (has_inline or LOCAL in text):
         new_doc, changed, errors = externalize(doc, catalog, prefix, label)
@@ -396,10 +398,14 @@ def broken_refs(files: list[Path], root: Path) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
-def run(components_dir: Path, apis_dir: Path, apis: list[Path], mode: str) -> int:
+def run(components_dir: Path, apis_dir: Path, apis: list[Path], mode: str,
+        catalogs: dict[str, Catalog] | None = None, naming=disk_name,
+        title: str = "dernière version de chaque API") -> int:
     """mode : write | dry-run | check. Renvoie le code de sortie.
-    Sans API donnée : dernière version de chaque API de apis_dir."""
-    catalogs = load_catalogs(components_dir)
+    Sans API donnée : dernière version de chaque API de apis_dir.
+    catalogs, naming : fournis par la v2 (un seul dossier schemas/ pour toutes les sections)."""
+    catalogs = catalogs or load_catalogs(components_dir)
+    unique = list({id(c): c for c in catalogs.values()}.values())
     targets, older = (apis, []) if apis else discover_apis(apis_dir, components_dir)
     root = apis_dir
     tag = {"dry-run": "[simulation] ", "check": "[contrôle] "}.get(mode, "")
@@ -407,11 +413,11 @@ def run(components_dir: Path, apis_dir: Path, apis: list[Path], mode: str) -> in
     # Une ligne par API : à jour, mise à jour, ou erreur.
     results = []
     for api in targets:
-        api_changes, api_errors = sync_api(api, catalogs, mode == "write", root)
+        api_changes, api_errors = sync_api(api, catalogs, mode == "write", root, naming)
         results.append((display(api, root), api_changes, api_errors))
     updated = sum(1 for _, changes, errors in results if changes and not errors)
     failed = sum(1 for _, _, errors in results if errors)
-    print(f"{tag}Synchronisation de {len(targets)} API (dernière version de chaque API) :")
+    print(f"{tag}Synchronisation de {len(targets)} API ({title}) :")
     for label, changes, errors in results:
         if errors:
             print(f"  ✖ {label} : {len(errors)} erreur(s), API non modifiée")
@@ -430,12 +436,12 @@ def run(components_dir: Path, apis_dir: Path, apis: list[Path], mode: str) -> in
 
     errors = []
     if mode in ("write", "check"):
-        errors = broken_refs(targets + [f for c in catalogs.values() for f in c.files()], root)
+        errors = broken_refs(targets + [f for c in unique for f in c.files()], root)
         if errors:
             print(f"{tag}✖ Références cassées :")
             for error in errors:
                 print(f"  ✖ {error}")
-    changelogs = {catalog.label(name): added for catalog in catalogs.values()
+    changelogs = {catalog.label(name): added for catalog in unique
                   for name in sorted(catalog.versions)
                   if (added := update_changelog(catalog, name, write=mode == "write"))}
     if changelogs:

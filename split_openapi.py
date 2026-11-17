@@ -78,6 +78,10 @@ def file_name(name: str, version) -> str:
     return f"{name}_V{version}.yaml"
 
 
+# Niveau des fonctions partagées : les scripts v2 vérifient qu'ils ont la bonne version de ce fichier.
+SHARED_LEVEL = 2
+
+
 def fragment(name: str, section: str = "schemas") -> str:
     """Le composant est dans components.<section>.<Nom> de son fichier : une $ref doit y pointer,
     sinon elle désigne tout le document (info compris)."""
@@ -485,6 +489,7 @@ def split_schemas(schemas: dict, origins: dict, out: Path, forced_major: set[str
     if report is not None:
         report["chosen"] = {splitter.fn(name): version for name, version in splitter.chosen.items()}
         report["bumped"] = {splitter.fn(name) for name in splitter.major_bumped}
+        report["final"] = {name: splitter.fn(name) for name in schemas}  # nom préparé -> nom écrit (renommage)
     base_of = {splitter.fn(base): base for base in schemas}
 
     def origin_of(disk: str) -> tuple[str, str]:
