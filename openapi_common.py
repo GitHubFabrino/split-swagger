@@ -27,6 +27,7 @@ import yaml
 SOURCE_FILE = Path("swaggers/RDV/schemas/rdv-actor-schemas.yaml")  # fichier de composants en bloc à découper
 COMPONENTS_DIR = Path("swaggers/RDV/components")                    # sortie (créée automatiquement) :
 SCHEMAS_DIR = COMPONENTS_DIR / "schemas"                            #   components/<section>/<Nom>/<Nom>_V<x.y>.yaml
+SCHEMAS_DIR_V2 = Path("swaggers/RDV/schemas")                       # v2 : un seul dossier, toutes sections confondues
 APIS_DIR = Path("swaggers/RDV")                                     # où chercher les API : <api>/v<x>/<api>.yaml
 
 # ================================================================ YAML 1.2
@@ -523,7 +524,7 @@ def map_block_refs(node, to_ref):
 
 # Référence vers un fichier de schéma découpé : …/Nom/Nom_V1.2.yaml(#/components/schemas/Nom)
 SCHEMA_FILE_REF = re.compile(
-    r"(?:^|[\\/])(?P<name>[^/\\#]+)[\\/](?P=name)_[vV](?P<version>\d+\.\d+)\.yaml(?:#/components/[A-Za-z]+/(?P=name))?$")
+    r"(?:^|[\\/])(?P<name>[^/\\#]+)[\\/](?P=name)_[vV](?P<version>\d+\.\d+)\.yaml(?:#/components/(?P<section>[A-Za-z]+)/(?P=name))?$")
 
 
 def to_sibling_refs(node):
@@ -536,6 +537,27 @@ def to_sibling_refs(node):
     copy = {}
     for key, value in node.items():
         m = SCHEMA_FILE_REF.search(value) if key == "$ref" and isinstance(value, str) else None
-        copy[key] = (f"../{m['name']}/{m['name']}_V{m['version']}.yaml#/components/schemas/{m['name']}" if m
+        copy[key] = (f"../{m['name']}/{m['name']}_V{m['version']}.yaml#/components/{m['section'] or 'schemas'}/{m['name']}" if m
                      else to_sibling_refs(value))
     return copy
+
+
+# ================================================================ v2 : un seul dossier schemas/
+
+V2_PREFIX = {"parameters": "Query", "responses": "Response", "securitySchemes": "Security"}
+
+
+def naming_v2(section: str, name: str) -> str:
+    """Nom sur disque en v2 : schémas comme en v1 ; les autres sections préfixées.
+        parameters      actorIdParam -> QueryActorIdParam
+        responses       BadRequest   -> ResponseBadRequest
+        securitySchemes oauth2       -> SecurityOauth2
+    Un nom qui commence déjà par le préfixe (queryLimit -> QueryLimit) ne le reçoit pas deux fois."""
+    if section == "schemas":
+        return schema_naming(name)[0]
+    prefix, pascal = V2_PREFIX[section], pascal_case(name)
+    if not pascal:
+        raise ValueError(f"{section}.{name} : nom impossible à convertir")
+    if pascal.startswith(prefix) and pascal[len(prefix):][:1].isupper():
+        return pascal
+    return prefix + pascal
