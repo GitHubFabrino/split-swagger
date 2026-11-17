@@ -5,16 +5,21 @@ v3 — Synchronise une API (ou toutes) avec le dossier unique des composants.
     python sync_schemas_v3.py <api.yaml>     une API (la dernière version de cette API)
     python sync_schemas_v3.py --all          la dernière version de chaque API
 
-Pour chaque API :
+Pour chaque API, seules les références vers les composants sont mises à jour :
   1. $ref vers le fichier en bloc (…/rdv-actor-schemas.yaml#/components/<section>/X) -> fichier découpé ;
-  2. schémas encore définis dans l'API, identiques à une version existante -> $ref vers cette version ;
-  3. chaque $ref vers un fichier découpé -> dernière version de la même majeure ;
+  2. chaque $ref vers un fichier découpé -> dernière version de la même majeure (1.0 -> 1.1).
+Les schémas définis dans une API ne sont jamais touchés : seul extract_api_schemas_v3.py les extrait.
 puis contrôle des références cassées et mise à jour des CHANGELOG.md. Une ancienne version d'API
 n'est jamais modifiée.
+
+--all n'analyse pas une API inchangée depuis sa dernière synchronisation réussie, tant qu'aucun composant
+n'a reçu de nouvelle version (mémoire : <SCHEMAS_DIR>/.sync-state.json, régénérée si on la supprime).
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sys
 from datetime import date
@@ -22,8 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openapi_common_v3 import (  # noqa: E402
-    APIS_DIR, BLOCK_REF, LOCAL, SCHEMAS_DIR, SECTIONS, SPLIT_REF, api_name, dump, existing_versions, file_name,
-    file_ref, load, map_refs, naming, relpath, renamed_for_api, schema_diff, schema_naming, shape, to_sibling_refs)
+    APIS_DIR, BLOCK_REF, SCHEMAS_DIR, SECTIONS, SPLIT_REF, dump, existing_versions, file_name, file_ref, load, map_refs, naming, relpath, schema_diff)
 
 # ================================================================ catalogue (synchronisation)
 
@@ -160,59 +164,16 @@ VERSIONED = re.compile(r"(?<=/)(?P<name>[^/\s'\"#]+)/(?P=name)_V(?P<major>\d+)\.
 RELATIVE = re.compile(r":\s*['\"]?(?P<ref>\.\.?/[^'\"\s#]+\.ya?ml)(?:#/components/(?P<section>[A-Za-z]+)/(?P<name>[^'\"\s]+))?")
 
 
-def externalize(doc: dict, catalog: Catalog, folder: str, label: str) -> tuple[dict, list[str], list[str]]:
-    """Schémas définis dans l'API : remplacés par la version identique existante (nom normal, ou nom
-    renommé avec l'API à l'extraction : Error -> ErrorRdvAdminActor), puis retirés de l'API."""
-    inline = (doc.get("components") or {}).get("schemas") or {}
-    if not inline:
-        return doc, [], []
-    renamed = {n: schema_naming(n)[0] for n in inline}
-    alternative = {n: renamed_for_api(renamed[n], schema_naming(n)[1], api_name(label))[0] for n in inline}
-    found: dict[str, tuple] = {}
-    for _ in range(len(inline) + 1):            # un renommage change le contenu attendu des schémas qui l'utilisent
-        found, changed = {}, False
-        for name, schema in inline.items():
-            target = shape(to_sibling_refs(map_refs(schema, lambda v, _: (
-                file_ref(renamed[m["name"]], (0, 0), "schemas") if (m := LOCAL.match(v)) and m["name"] in inline
-                else v))))
-            for candidate in dict.fromkeys((renamed[name], alternative[name])):
-                match = next((v for v in reversed(catalog.versions.get(candidate, []))
-                              if shape(catalog.content(candidate, v)) == target), None)
-                if match:
-                    found[name] = (candidate, catalog.latest(candidate, match[0]))
-                    changed |= candidate != renamed[name]
-                    renamed[name] = candidate
-                    break
-        if not changed:
-            break
-    missing = sorted(set(inline) - set(found))
-    if missing:
-        return doc, [], [f"{n} défini dans l'API ne correspond à aucun composant existant "
-                         f"(lancez extract_api_schemas_v3.py {label})" for n in missing]
-
-    def replace(value: str, _) -> str:
-        m = LOCAL.match(value)
-        return catalog.ref(*found[m["name"]], folder) if m and m["section"] == "schemas" and m["name"] in found else value
-    components = {k: v for k, v in doc["components"].items() if k != "schemas"}
-    new = map_refs({**doc, "components": components}, replace)
-    if not new["components"]:
-        del new["components"]
-    return new, [f"{n} -> {found[n][0]} v{found[n][1][0]}.{found[n][1][1]}" for n in sorted(found)], []
-
-
 def sync_api(api: Path, catalog: Catalog) -> tuple[list[str], list[str]]:
-    """Synchronise une API ; rien n'est écrit en cas d'erreur. Renvoie (changements, erreurs)."""
-    label, text = display(api), api.read_text(encoding="utf-8")
+    """Synchronise une API : seules ses références vers des composants découpés sont mises à jour.
+    Les schémas définis dans l'API ne sont jamais touchés (seul extract_api_schemas_v3.py les extrait).
+    Rien n'est écrit en cas d'erreur. Renvoie (changements, erreurs)."""
+    text = api.read_text(encoding="utf-8")
     try:
         doc = load(api)
     except ValueError as error:
         return [], [str(error)]
-    folder = relpath(catalog.dir, api.parent)
     doc, changes = resolve_block_refs(doc, catalog, api.parent)
-    doc, inline_changes, errors = externalize(doc, catalog, folder, label)
-    if errors:
-        return [], errors
-    changes += inline_changes
     if changes:
         text = dump(doc)
 
@@ -249,24 +210,55 @@ def broken_refs(files: list[Path]) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
-def run(apis: list[Path], title: str) -> int:
+# Mémoire de la dernière synchronisation réussie : {API: empreinte du fichier + des versions disponibles}.
+STATE = SCHEMAS_DIR / ".sync-state.json"
+
+
+def fingerprint(api: Path, catalog: Catalog) -> str:
+    """Change si l'API est modifiée ou si un composant reçoit une nouvelle version (ou en perd une)."""
+    versions = json.dumps(sorted(catalog.versions.items()))
+    return hashlib.sha256(api.read_bytes() + versions.encode()).hexdigest()
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def run(apis: list[Path], title: str, skip_unchanged: bool = False) -> int:
+    """skip_unchanged (--all) : une API inchangée depuis sa dernière synchronisation réussie, alors qu'aucun
+    composant n'a changé de versions, n'est pas analysée."""
     catalog = Catalog(SCHEMAS_DIR)
+    state = load_state()
+    skipped = [api for api in apis if skip_unchanged and state.get(display(api)) == fingerprint(api, catalog)]
     print(f"Synchronisation de {len(apis)} API ({title}) :")
-    updated = failed = 0
+    apis = [api for api in apis if api not in skipped]
+    if skipped:
+        print(f"  · {len(skipped)} API inchangée(s) depuis la dernière synchronisation, non analysée(s)")
+    updated, failed, current, succeeded = [], [], [], []
     for api in apis:
         changes, errors = sync_api(api, catalog)
+        label = display(api)
         if errors:
-            failed += 1
-            print(f"  ✖ {display(api)} : API non modifiée")
+            failed.append(api)
+            print(f"  ✖ {label} : API non modifiée")
             for error in errors:
                 print(f"      ✖ {error}")
-        elif changes:
-            updated += 1
-            print(f"  ↑ {display(api)} : mise à jour")
+            continue
+        succeeded.append(api)
+        if changes:
+            updated.append(api)
+            print(f"  ↑ {label} : mise à jour")
             for change in dict.fromkeys(changes):
                 print(f"      ↑ {change}")
         else:
-            print(f"  ✔ {display(api)} : à jour")
+            current.append(api)
+            if not skip_unchanged:
+                print(f"  ✔ {label} : à jour")
+    if skip_unchanged and current:
+        print(f"  ✔ {len(current)} API à jour (aucun composant utilisé n'a changé)")
     broken = broken_refs(apis + [f for d in SCHEMAS_DIR.iterdir() if d.is_dir() for f in d.glob("*.yaml")])
     if broken:
         print("✖ Références cassées :")
@@ -277,7 +269,14 @@ def run(apis: list[Path], title: str) -> int:
         print("Changelog mis à jour :")
         for name, added in logs.items():
             print(f"  {name}/CHANGELOG.md : + {', '.join(added)}")
-    print(f"Bilan : {len(apis) - updated - failed} à jour, {updated} mise(s) à jour, {failed} en erreur"
+    # On ne mémorise que les API synchronisées sans erreur ni référence cassée : les autres seront réanalysées.
+    for api in succeeded:
+        if not any(error.startswith(display(api) + " :") for error in broken):
+            state[display(api)] = fingerprint(api, catalog)
+    STATE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Bilan : {len(current)} à jour, {len(updated)} mise(s) à jour, "
+          f"{len(failed)} en erreur"
+          + (f", {len(skipped)} non analysée(s) (inchangées)" if skipped else "")
           + (f", {len(broken)} référence(s) cassée(s)" if broken else ""))
     return 1 if failed or broken else 0
 
@@ -287,7 +286,7 @@ def main() -> None:
     try:
         if args == ["--all"]:
             latest, older = discover_apis(APIS_DIR, SCHEMAS_DIR)
-            code = run(latest, "dernière version de chaque API")
+            code = run(latest, "dernière version de chaque API", skip_unchanged=True)
             if older:
                 print(f"  · anciennes versions ignorées : {', '.join(display(f.parent) for f in older)}")
         elif len(args) == 1 and not args[0].startswith("-"):
