@@ -5,8 +5,9 @@ un dossier par composant (schemas, parameters, responses, securitySchemes), une 
 
     python split_openapi_v3.py
 
-Versions : identique -> réutilisé ; modifié -> mineure (1.3 -> 1.4) ; cassant -> majeure (1.3 -> 2.0),
-annoncée par un message, sans confirmation ; une dépendance passée en majeure entraîne ses utilisateurs.
+Versions : identique -> réutilisé ; modifié -> mineure (1.3 -> 1.4) ; cassant -> majeure (1.3 -> 2.0), annoncée
+par un message, sans confirmation. Les composants qui utilisent un composant modifié ne changent pas de version :
+sync_schemas_v3.py met ensuite leurs refs à jour (dernière version), ainsi que celles des API.
 Les autres sections du fichier en bloc (examples, headers…) y restent ; les références y pointent.
 """
 
@@ -132,10 +133,11 @@ def dependency_groups(graph: dict[str, set[str]]) -> list[list[str]]:
 
 class Versioner:
     """Choisit la version de chaque composant, puis les écrit.
-      identique à une version existante            -> réutilisée (dernière de sa majeure) ;
+      même contenu que la dernière version         -> réutilisée (si des dépendances ont une version plus récente,
+                                                      le sync mettra ses refs à jour) ;
       modifié                                      -> mineure suivante de la dernière version (1.3 -> 1.4) ;
-      modifié de façon cassante, ou une dépendance -> majeure suivante (1.3 -> 2.0), sans confirmation ;
-      passée en majeure
+      modifié de façon cassante                    -> majeure suivante (1.3 -> 2.0), sans confirmation ;
+    tous les utilisateurs (API et composants) suivent toujours la dernière version, quel que soit son numéro.
       nouveau                                      -> 1.0.
     api (extraction) : un composant dont le nom existe déjà, créé depuis une autre source, est comparé
     détail par détail : identique -> réutilisé ; différent -> renommé avec le nom de l'API."""
@@ -144,8 +146,8 @@ class Versioner:
         self.items, self.out, self.source, self.api = items, out, source, api
         self.final: dict[str, str] = {}               # renommage avec le nom de l'API
         self.chosen: dict[str, tuple[int, int]] = {}
-        self.majors: set[str] = set()                 # passés en majeure
         self.writes: list[tuple[str, tuple, dict, str | None]] = []
+        self.refreshed: list[tuple[str, tuple, dict, dict]] = []  # refs mises à jour sur place
         self.notes: list[str] = []
         self.warnings: list[str] = []
         self._cache: dict = {}
@@ -186,14 +188,14 @@ class Versioner:
         """Extraction : un nom déjà pris par un composant différent venant d'ailleurs -> renommé avec l'API."""
         members = set(group)
         for _ in range(len(group) + 1):          # renommer un membre d'un cycle change le contenu des autres
-            disk, renamed = {self.fn(n) for n in group}, False
+            renamed = False
             for name in group:
                 if name in self.final or not self.versions(name):
                     continue
                 latest = self.versions(name)[-1]
                 existing, draft, source = self.read(name, latest), self.content(name, members), self.source_of(name)
                 label = file_name(name, latest)[:-5]
-                if shape(existing, disk) == shape(draft, disk):
+                if self.same_but_versions(name, latest, draft):
                     self.notes.append(f"✔ {name} : identique à {label} (créé depuis {source}), "
                                       f"vérifié détail par détail -> réutilisé")
                 elif api_name(source) != self.api:
@@ -211,37 +213,38 @@ class Versioner:
             if not renamed:
                 return
 
+    def same_but_versions(self, name: str, version, draft: dict) -> bool:
+        """Même contenu que cette version, à la version des dépendances près (mineure ou majeure)."""
+        return shape(self.read(name, version)) == shape(draft)
+
     def decide(self, group: list[str]) -> None:
         if self.api:
             self.check_names(group)
         members = set(group)
-        disk = {self.fn(n) for n in group}
         draft = {n: self.content(n, members) for n in group}
 
-        # 1. Tous identiques à une version existante : réutilisés.
-        matches = {}
-        for n in group:
-            versions = self.versions(n)
-            match = next((v for v in reversed(versions) if shape(self.read(n, v), disk) == shape(draft[n], disk)), None)
-            if match:
-                matches[n] = max(v for v in versions if v[0] == match[0])
-        if len(matches) == len(group):
+        # 1. Même contenu que la dernière version (à la version des dépendances près) : pas de nouvelle version
+        #    (le sync mettra ensuite ses refs à jour si une dépendance a une version plus récente).
+        latest = {n: self.versions(n)[-1] for n in group if self.versions(n)}
+        if len(latest) == len(group) and all(self.same_but_versions(n, latest[n], draft[n]) for n in group):
             for n in group:
-                self.chosen[n] = matches[n]
-                self.writes.append((self.fn(n), matches[n], self.read(n, matches[n]), None))
+                self.chosen[n] = latest[n]
+            for n in group:
+                old, new = ref_versions(self.read(n, latest[n])), ref_versions(self.content(n))
+                moved = {d: v for d, v in new.items() if old.get(d) != v}
+                self.refreshed.append((self.fn(n), latest[n], moved, old))
+                self.writes.append((self.fn(n), latest[n], self.content(n), None))
             return
 
-        # 2. Nouvelle version pour tout le groupe : majeure si cassant ou si une dépendance l'est devenue.
-        latest = {n: self.versions(n)[-1] for n in group if self.versions(n)}
+        # 2. Nouvelle version pour tout le groupe : majeure si le changement est cassant (le numéro le signale ;
+        #    tous les utilisateurs suivent quand même la dernière version).
         breaking = {n: b for n in latest if (b := breaking_changes(self.read(n, latest[n]), draft[n]))}
-        cascade = sorted(self.fn(d) for n in group for d in self.deps(n) - members if d in self.majors)
-        is_major = bool(breaking or cascade)
+        is_major = bool(breaking)
         for n in group:
             if n not in latest:
                 self.chosen[n] = (1, 0)
             elif is_major:
                 self.chosen[n] = (latest[n][0] + 1, 0)
-                self.majors.add(n)
             else:
                 self.chosen[n] = (latest[n][0], latest[n][1] + 1)
 
@@ -256,18 +259,15 @@ class Versioner:
                 if n in breaking:
                     why = f"changement cassant : {' ; '.join(breaking[n])}"
                 elif shape(old) == shape(content):
-                    moved = sorted(d for d, v in ref_versions(content).items() if ref_versions(old).get(d) != v)
-                    why = f"cascade : {', '.join(moved)}" if moved else "cascade dans le cycle"
+                    why = "cascade dans le cycle"
                 else:
                     why = "contenu modifié"
                 reason = f"{before} -> {version[0]}.{version[1]}, {why}" + (f" ({cycle})" if cycle else "")
                 if is_major:
                     self.warnings.append(
                         f"{self.fn(n)} passé en version majeure {version[0]}.0"
-                        + (" (changement cassant)" if n in breaking else f" (dépendance passée en majeure : "
-                           f"{', '.join(cascade) or cycle})")
-                        + f". Les API restent sur la {latest[n][0]}.x : passez-les à la {version[0]}.0 à la main "
-                          f"quand elles sont prêtes.")
+                        + (" (changement cassant)" if n in breaking else f" (cycle : {cycle})")
+                        + f" : les API et schémas qui l'utilisent passent à la {version[0]}.0 au prochain sync.")
                 if not self.api and self.source_of(n) != self.source:
                     self.warnings.append(f"{self.fn(n)} existait déjà, créé depuis {self.source_of(n)} : sa nouvelle "
                                          f"version vient de {self.source}. Si ce n'est pas le même composant, "
@@ -295,6 +295,12 @@ class Versioner:
                   + (f", … (+{len(reused) - 30})" if len(reused) > 30 else ""))
         for warning in self.warnings:
             print(f"  ⚠ {warning}")
+        stale = sorted(disk for disk, _, moved, old in self.refreshed if any(
+            v > old.get(d, v) for d, v in moved.items()))
+        if stale:
+            print(f"  → {len(stale)} composant(s) utilisent une version plus ancienne de ces composants "
+                  f"({', '.join(stale[:8])}{', …' if len(stale) > 8 else ''}) : "
+                  f"lancez sync_schemas_v3.py --all pour les mettre à jour, ainsi que les API.")
         return {name: (self.fn(name), self.chosen[name]) for name in self.items}
 
     def render(self, name: str, disk: str, version, content: dict) -> str:

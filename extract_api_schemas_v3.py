@@ -11,7 +11,7 @@ puis synchronise l'API.
 2. schemas, parameters, responses et securitySchemes de components sont découpés comme le split, avec une
    vérification détaillée quand le nom existe déjà : identique -> réutilisé ; différent et venant d'une
    autre source -> renommé avec le nom de l'API (ResponseBadRequestRdvAdminActor) ; même API -> nouvelle
-   version (majeure si cassante, annoncée par un message).
+   version (majeure si cassante, annoncée par un message ; tous les utilisateurs suivent la dernière version).
 3. Les composants extraits sont retirés de l'API et leurs usages pointent vers les fichiers ; les
    securitySchemes restent par leur nom (la section security: les désigne ainsi), avec une $ref.
 4. L'API est synchronisée.
@@ -78,12 +78,14 @@ def lift_parameters(doc: dict, catalog: Catalog, folder: str) -> list[str]:
         f"    {note} ({count}×)" for note, count in counts.items()]
 
 
-def extract(api: Path) -> None:
+def extract(api: Path) -> tuple[set[str], set[str]]:
+    """Renvoie (composants extraits ou réutilisés par l'API, composants qui ont reçu une nouvelle version)."""
     label = display(api)
     doc = load(api)
     if not isinstance(doc, dict):
         raise ValueError(f"{label} : fichier YAML OpenAPI attendu")
     catalog = Catalog(SCHEMAS_DIR)
+    before = {name: versions[-1] for name, versions in catalog.versions.items()}
     folder = relpath(SCHEMAS_DIR, api.parent)
     doc, _ = resolve_block_refs(doc, catalog, api.parent)
     notes = lift_parameters(doc, catalog, folder)
@@ -99,6 +101,7 @@ def extract(api: Path) -> None:
     else:
         print(f"  → à extraire : {', '.join(f'{s} {len(i)}' for s, i in present.items())}")
         result = split_components(present, SCHEMAS_DIR, label, relpath(api, SCHEMAS_DIR / "X"), api_name(label))
+        extracted = {final for mapping in result.values() for final, _ in mapping.values()}
 
         # Retrait des composants extraits ; chaque usage pointe vers son fichier.
         for section in present:
@@ -125,6 +128,9 @@ def extract(api: Path) -> None:
     if notes or present:
         api.write_text(dump(doc), encoding="utf-8")
     print()
+    after = Catalog(SCHEMAS_DIR).versions
+    created = {name for name, versions in after.items() if name in before and versions[-1] != before[name]}
+    return (extracted if present else set()), created
 
 
 def main() -> None:
@@ -135,8 +141,8 @@ def main() -> None:
     try:
         check_latest(api)
         SCHEMAS_DIR.mkdir(parents=True, exist_ok=True)
-        extract(api)
-        sys.exit(run([api], "API extraite"))
+        extracted, created = extract(api)
+        sys.exit(run([api], "API extraite", extracted={api: extracted}, created=created))
     except (ValueError, OSError) as error:
         sys.exit(f"✖ {error}")
 
