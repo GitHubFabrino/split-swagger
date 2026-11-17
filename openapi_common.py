@@ -255,10 +255,16 @@ def shape(obj, only: set[str] | None = None) -> str:
 
 _BREAKING_TEXT = {  # avertissements de split_openapi.py (fr) et changelog (en)
     "fr": {"type": "{at} : type modifié", "enum": '{at} : valeur d\'enum "{value}" retirée',
-           "required": "{at} : devenu obligatoire", "removed": "{at} : supprimé", "root": "racine"},
+           "required": "{at} : devenu obligatoire", "removed": "{at} : supprimé", "root": "racine",
+           "changed": "{at} : modifié"},
     "en": {"type": "`{at}`: type changed", "enum": "`{at}`: enum value `{value}` removed",
-           "required": "`{at}`: now required", "removed": "`{at}`: removed", "root": "(schema)"},
+           "required": "`{at}`: now required", "removed": "`{at}`: removed", "root": "(schema)",
+           "changed": "`{at}`: changed"},
 }
+
+
+def _as_list(value) -> list:
+    return value if isinstance(value, list) else []
 
 
 def breaking_changes(old, new, at: str = "", lang: str = "fr") -> list[str]:
@@ -272,9 +278,19 @@ def breaking_changes(old, new, at: str = "", lang: str = "fr") -> list[str]:
     found = []
     if "type" in old and "type" in new and canon(old["type"]) != canon(new["type"]):
         found.append(text["type"].format(at=here))
-    found += [text["enum"].format(at=here, value=v) for v in old.get("enum", []) if v not in new.get("enum", [])]
-    found += [text["required"].format(at=f"{prefix}{r}") for r in new.get("required", [])
-              if r not in old.get("required", [])]
+    found += [text["enum"].format(at=here, value=v) for v in _as_list(old.get("enum"))
+              if v not in _as_list(new.get("enum"))]
+    if isinstance(new.get("required"), bool):  # parameter : required: true / false
+        if new["required"] and not old.get("required"):
+            found.append(text["required"].format(at=here))
+    else:                                       # schéma : liste des champs obligatoires
+        found += [text["required"].format(at=f"{prefix}{r}") for r in _as_list(new.get("required"))
+                  if r not in _as_list(old.get("required"))]
+    for key in ("name", "in"):                  # parameter renommé ou déplacé (query -> header…)
+        if key in old and key in new and old[key] != new[key]:
+            found.append(text["changed"].format(at=f"{prefix}{key}"))
+    if isinstance(old.get("schema"), dict):     # parameter : son schéma
+        found += breaking_changes(old["schema"], new.get("schema"), at, lang)
     new_properties = new.get("properties") or {}
     for key, sub in (old.get("properties") or {}).items():
         if key not in new_properties:
@@ -354,7 +370,9 @@ def schema_diff(old, new) -> dict[str, list[str]]:
             for key in a.keys() | b.keys():
                 if key == "x-sources" or key == "$ref":
                     continue
-                if key in ("required", "enum"):  # liste absente = liste vide : on détaille valeur par valeur
+                if key in ("required", "enum") and all(isinstance(x.get(key, []), list) for x in (a, b)):
+                    # liste absente = liste vide : on détaille valeur par valeur (required: true d'un parameter
+                    # est un booléen, comparé comme une valeur simple)
                     walk(a.get(key) or [], b.get(key) or [], path + [key])
                     continue
                 if key not in b:
